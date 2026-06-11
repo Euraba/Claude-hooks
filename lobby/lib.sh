@@ -24,11 +24,19 @@ LOBBY_DIR="$LOBBY_ANCHOR/.claude"
 LOBBY_FILE="$LOBBY_DIR/lobby.json"
 LOBBY_LOCK="$LOBBY_DIR/lobby.lock"
 
-# Debug log so we can see if hooks are firing across sessions.
-{
-  printf '[%s] %s pid=%s ppid=%s cwd=%s CLAUDE_PROJECT_DIR=%s anchor=%s\n' \
-    "$(date -Iseconds)" "$0" "$$" "$PPID" "$PWD" "${CLAUDE_PROJECT_DIR:-UNSET}" "$LOBBY_ANCHOR"
-} >> /tmp/lobby-hook-debug.log 2>/dev/null || true
+# Where the lobby scripts themselves live, for self-referencing paths in
+# injected context (works regardless of where the repo was cloned).
+LOBBY_BIN="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Opt-in debug log (set LOBBY_DEBUG_LOG=/path/to/log) to see hooks firing
+# across sessions. Off by default: an always-on shared log in /tmp would
+# grow unbounded and leak project paths to other users on the host.
+if [[ -n "${LOBBY_DEBUG_LOG:-}" ]]; then
+  {
+    printf '[%s] %s pid=%s ppid=%s cwd=%s CLAUDE_PROJECT_DIR=%s anchor=%s\n' \
+      "$(date -Iseconds)" "$0" "$$" "$PPID" "$PWD" "${CLAUDE_PROJECT_DIR:-UNSET}" "$LOBBY_ANCHOR"
+  } >> "$LOBBY_DEBUG_LOG" 2>/dev/null || true
+fi
 
 lobby_init() {
   mkdir -p "$LOBBY_DIR"
@@ -68,6 +76,11 @@ portable_realpath() {
   printf '%s\n' "${out:-/}"
 }
 
+# File mtime in epoch seconds: GNU stat (-c) vs BSD/macOS stat (-f).
+portable_mtime() {
+  stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null
+}
+
 # Atomic write: jq into a temp file in the same dir, then rename.
 lobby_write() {
   local filter=$1
@@ -103,7 +116,7 @@ lobby_gc_rooms() {
   now=$(date +%s)
   for f in "$rooms_dir"/*.jsonl; do
     [[ -e "$f" ]] || break
-    mtime=$(stat -c %Y "$f" 2>/dev/null) || continue
+    mtime=$(portable_mtime "$f") || continue
     (( now - mtime < 60 )) && continue
     room=$(basename "$f" .jsonl)
     if [[ $(jq -r --arg room "$room" \
@@ -163,7 +176,7 @@ room_deliver_new() {
         else "  " + .from_short + ": " + .text end
     ')
     if [[ -n "$rendered" ]]; then
-      printf '[ROOM %s] new messages (use `~/.claude/hooks/lobby/room.sh say --session %s --text "..."` to reply, or `room.sh leave --session %s` to exit):\n%s' "$room" "$sid" "$sid" "$rendered"
+      printf '[ROOM %s] new messages (use `%s/room.sh say --session %s --text "..."` to reply, or `room.sh leave --session %s` to exit):\n%s' "$room" "$LOBBY_BIN" "$sid" "$sid" "$rendered"
     fi
     lobby_write '
       .sessions |= map(if .session_id == $sid then .room_cursor = ($n | tonumber) else . end)

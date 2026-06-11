@@ -27,9 +27,27 @@ coordination this turn" rather than stalling every hook and tool call.
 All cross-session text reaches an agent by being **injected into its context** — at the
 start of each turn (`UserPromptSubmit`) and after every file edit (`PostToolUse`).
 
+## Install
+
+```bash
+git clone <repo-url> ~/.claude/hooks   # or anywhere you like
+~/.claude/hooks/install.sh
+```
+
+`install.sh` is idempotent (safe to re-run after pulling updates or moving the repo). It:
+
+1. Checks dependencies (`jq`, `flock`, `git`).
+2. Registers the six hooks in `~/.claude/settings.json` — previous lobby entries are
+   replaced, everything else is preserved, and a timestamped backup is written first.
+3. Installs the `/btw` and `/room` slash commands into `~/.claude/commands/`, rewritten
+   to point at wherever you cloned the repo.
+
+Then copy the [agent protocol block](#teach-your-agents-the-protocol) into your
+`~/.claude/CLAUDE.md` and restart any running Claude Code sessions.
+
 ## How it's wired (hooks)
 
-These scripts are registered as Claude Code hooks in `~/.claude/settings.json`:
+`install.sh` registers these scripts as Claude Code hooks in `~/.claude/settings.json`:
 
 | Hook event        | Matcher                            | Script                | Role |
 |-------------------|------------------------------------|-----------------------|------|
@@ -50,7 +68,10 @@ Supporting pieces:
 - `lobby/room.sh` — CLI behind the `/room` slash command (`invite` / `accept` / `say` /
   `leave` / `show` / `list`).
 
-The `/btw` and `/room` slash commands live in `~/.claude/commands/`.
+- `install.sh` — idempotent installer (hooks + slash commands).
+- `commands/btw.md`, `commands/room.md` — the `/btw` and `/room` slash commands,
+  installed into `~/.claude/commands/`.
+- `tests/smoke.sh` — end-to-end smoke test simulating two sessions across two repos.
 
 ## Data model
 
@@ -125,10 +146,76 @@ Inspect state manually:
 ~/.claude/hooks/lobby/room.sh list     # active rooms and members
 ```
 
+## Teach your agents the protocol
+
+The hooks inject presence and messages into context, but agents also need standing
+instructions: when to post intent notes, how to answer `[INBOX]` messages, room
+etiquette. Copy this block into your `~/.claude/CLAUDE.md` (adjust the paths if you
+cloned the repo somewhere other than `~/.claude/hooks`):
+
+```markdown
+## Multi-session coordination (lobby)
+
+When `UserPromptSubmit` context tells you another Claude session is active in this
+project (look for `You are session <short>. Other active Claude sessions...`), before
+starting non-trivial work, post your intent so the other session can see what you're
+touching:
+
+    ~/.claude/hooks/lobby/note.sh set --session <your-full-session-id> \
+      --note "<one-line intent>" \
+      --plan "<path to your plan file, if any>" \
+      --files "<comma-separated abs paths you expect to touch>"
+
+- Your **short** id appears in the injection; pass the **full** session id to
+  `--session`. If unknown, check `<repo>/.claude/lobby.json` for the entry whose
+  short id matches.
+- Re-post (overwrite) when scope changes. The note auto-clears on SessionEnd or
+  after 30min idle.
+- Clear early when done: `note.sh clear --session <sid>`.
+- Skip for trivial edits (typos, one-file fixes unlikely to overlap).
+- Inspect all sessions' notes: `~/.claude/hooks/lobby/note.sh show`.
+
+### Asking another session a question (/btw)
+
+If a file Edit/Write is denied because another session has claimed the file (the
+`PreToolUse` deny reason mentions a session short id), do NOT just give up. Use
+`/btw` to ask that session what it intends:
+
+    /btw <other_short_id> Will you modify <method/symbol> in <file>? I need to <reason>.
+
+- Targets a single session by short id, or `all` to broadcast.
+- The recipient sees your message in their next `UserPromptSubmit` injection under
+  `[INBOX]`.
+- When you receive a message under `[INBOX]`, respond promptly (with
+  `/btw <sender_short_id> ...`) and then clear your inbox using the exact ack
+  command shown in the injection.
+- Inspect any session's inbox manually: `~/.claude/hooks/lobby/btw.sh show`.
+
+### Private rooms (/room)
+
+For sustained back-and-forth (more than one or two `/btw` exchanges), open a
+private room. Each room is a shared append-only transcript; only members see it.
+Delivery is the same as inbox: at `UserPromptSubmit` and after every Edit/Write.
+
+- `/room invite <other_short_id> [topic]` (creates the room, sends an inbox invite)
+- Recipient: `/room accept <room_id>` (room id is in the `[ROOM INVITE]` message)
+- Either side: `/room say <message>` to send, `/room show` for the transcript,
+  `/room leave` when done.
+- One room per session at a time. Room files auto-delete when the last member
+  leaves or SessionEnd fires.
+- When you see a `[ROOM …] new messages` block in injected context, reply with
+  `/room say …` and don't ack via `btw.sh ack` (rooms have their own delivery
+  state, separate from the inbox).
+```
+
 ## Requirements
 
 - Bash, `jq`, `flock`, `git`, and standard coreutils (`date`, `mktemp`, `od`, `wc`, …).
+- Linux works out of the box. macOS needs `flock` (`brew install flock`); the GNU/BSD
+  differences in `stat` and `realpath` are handled internally.
 - Claude Code with hook support, and `CLAUDE_PROJECT_DIR` set (the hooks no-op without it).
+
+Debugging: set `LOBBY_DEBUG_LOG=/some/path` to log every hook invocation (off by default).
 
 ---
 
@@ -153,9 +240,8 @@ Inspect state manually:
 - **Best-effort cleanup.** `SessionEnd`/`Stop` may not fire on a hard crash or `kill -9`,
   leaving orphaned claims and inbox entries until stale-prune (which also garbage-collects
   room transcripts left with no members).
-- **`flock`/POSIX-only.** Relies on `flock` and same-host filesystem semantics; it will not
-  coordinate across machines or over a network share without working `flock`. Untested on
-  macOS/BSD (`flock`, `date -Iseconds`, `od` flags differ).
+- **Same-host only.** Relies on `flock` and same-host filesystem semantics; it will not
+  coordinate across machines or over a network share.
 - **No schema versioning or migration.** A malformed `lobby.json` is silently reset to empty
   by `lobby_init`, discarding all live state. There is no version field to evolve the format.
 - **Unbounded growth within a session.** Inboxes grow until `ack`; room transcripts grow
@@ -163,8 +249,6 @@ Inspect state manually:
 - **No authentication or privacy boundary.** Any process that can write the repo's `.claude/`
   can post as any session, read every inbox, and read any room transcript. "Private" rooms are
   private only by convention.
-- **Debug log is global and unrotated.** Every hook appends to `/tmp/lobby-hook-debug.log`
-  with no rotation; it grows indefinitely and is shared across all projects/users on the host.
 - **Hidden truncation in injection.** Long notes / many planned files are injected verbatim
   with no length budget, which can crowd the agent's context on busy projects.
 
@@ -184,13 +268,11 @@ Inspect state manually:
   rotate/trim room transcripts.
 - **Crash-resilient cleanup** — reconcile against actually-running session pids (or a liveness
   probe) so orphans are reclaimed promptly without waiting for the idle timeout.
-- **Configurable, rotated debug logging** — move the debug log under the repo (or make it
-  opt-in via env var) and cap its size.
-- **Cross-platform support** — abstract `date`/`od`/`flock` usage so the hooks run on
-  macOS/BSD, with a test matrix.
-- **Tests** — a harness that spins up simulated concurrent sessions to exercise claim
-  contention, message delivery, room lifecycle, and stale-pruning.
+- **More tests** — `tests/smoke.sh` covers claims, messaging, rooms, and GC end-to-end;
+  extend with true concurrent contention (parallel writers) and a Linux/macOS CI matrix.
 - **Richer presence in injection** — show how long ago a claim/note was made and summarize or
   budget long notes so context stays compact.
-- **Installer** — a script to register the hooks and slash commands in `settings.json`
-  idempotently, instead of manual wiring.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

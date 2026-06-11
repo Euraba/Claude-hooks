@@ -49,7 +49,7 @@ context=$(
       room_text=$(room_deliver_new "$session_id")
     fi
     main_text=$(
-    jq -r --arg sid "$session_id" '
+    jq -r --arg sid "$session_id" --arg bin "$LOBBY_BIN" '
       ((.sessions[] | select(.session_id == $sid) | .inbox) // []) as $inbox
       | [.sessions[] | select(
           .session_id != $sid and (
@@ -62,7 +62,7 @@ context=$(
         else
           "You are session " + ($sid[0:8]) + "." +
           (if ($inbox | length) > 0 then
-             "\n[INBOX] Messages from other sessions (run `~/.claude/hooks/lobby/btw.sh ack --session " + $sid + "` after handling):\n" +
+             "\n[INBOX] Messages from other sessions (run `" + $bin + "/btw.sh ack --session " + $sid + "` after handling):\n" +
              ($inbox | map("  - from " + .from_short + " at " + .sent_at + ": " + .text) | join("\n"))
            else "" end) +
           (if ($others | length) > 0 then
@@ -78,7 +78,7 @@ context=$(
                (if ((.claims        // []) | length) > 0
                   then "\n    actively editing: " + ((.claims // []) | join(", ")) else "" end)
              ) | join("\n")) +
-             "\nCoordinate via ~/.claude/hooks/lobby/note.sh (post intent) or /btw <short_id> <question> (ask another session) if you will touch overlapping files."
+             "\nCoordinate via " + $bin + "/note.sh (post intent) or /btw <short_id> <question> (ask another session) if you will touch overlapping files."
            else "" end)
         end
     ' "$LOBBY_FILE"

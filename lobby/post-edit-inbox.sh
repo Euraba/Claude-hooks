@@ -32,12 +32,12 @@ context=$(
     lobby_prune
 
     # Pull undelivered messages for this session, render them, then mark delivered.
-    undelivered=$(jq -r --arg sid "$session_id" '
+    undelivered=$(jq -r --arg sid "$session_id" --arg bin "$LOBBY_BIN" '
       ((.sessions[] | select(.session_id == $sid) | .inbox) // [])
       | map(select((.delivered_at // null) == null))
       | if length == 0 then ""
         else
-          "[INBOX] New messages arrived from other Claude sessions while you were working. Address them or run `~/.claude/hooks/lobby/btw.sh ack --session " + $sid + "` after handling:\n" +
+          "[INBOX] New messages arrived from other Claude sessions while you were working. Address them or run `" + $bin + "/btw.sh ack --session " + $sid + "` after handling:\n" +
           (map("  - from " + .from_short + " at " + .sent_at + ": " + .text) | join("\n"))
         end
     ' "$LOBBY_FILE")
