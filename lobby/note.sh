@@ -55,7 +55,7 @@ case "$cmd" in
         printf '%s' "$files" \
           | tr ',' '\n' \
           | awk '{gsub(/^ +| +$/, ""); if (NF) print}' \
-          | while IFS= read -r f; do realpath -m "$f"; done \
+          | while IFS= read -r f; do portable_realpath "$f"; done \
           | jq -R . | jq -s .
       )
     fi

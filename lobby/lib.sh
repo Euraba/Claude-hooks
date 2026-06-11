@@ -38,6 +38,36 @@ lobby_init() {
   [[ -e "$LOBBY_LOCK" ]] || : > "$LOBBY_LOCK"
 }
 
+# Resolve a path to absolute, normalized form. Tolerates non-existent paths
+# (so users can claim files they're about to create), like GNU `realpath -m`.
+# Prefers GNU `realpath -m` when available (also resolves symlinks); falls
+# back to a pure-bash implementation on BSD/macOS where `-m` doesn't exist
+# and plain `realpath` errors on non-existent paths.
+#
+# The fallback does NOT resolve symlinks — the lobby uses these strings for
+# human-readable display and string-equality claim checks, not canonical
+# identity, so symlink resolution isn't load-bearing.
+portable_realpath() {
+  local p="$1"
+  [[ -z "$p" ]] && { printf '\n'; return 0; }
+  if realpath -m "$p" 2>/dev/null; then
+    return 0
+  fi
+  case "$p" in
+    /*) ;;
+    *) p="$PWD/$p" ;;
+  esac
+  local IFS=/ part out=""
+  for part in $p; do
+    case "$part" in
+      ''|.) ;;
+      ..) out="${out%/*}" ;;
+      *) out="$out/$part" ;;
+    esac
+  done
+  printf '%s\n' "${out:-/}"
+}
+
 # Atomic write: jq into a temp file in the same dir, then rename.
 lobby_write() {
   local filter=$1
