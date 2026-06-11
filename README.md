@@ -28,6 +28,11 @@ coordination this turn" rather than stalling every hook and tool call.
 - **`/btw` inbox messaging** — fire-and-forget questions to one session or all sessions.
 - **`/room` private rooms** — a shared append-only transcript for sustained back-and-forth
   between two (or more) sessions.
+- **Main/reviewer orchestration** — a role layer for autonomous review loops: a **main**
+  session writes specs/code, 1–3 attached **reviewer** sessions review each milestone in
+  a shared review room, main fixes findings until all approve, and when main's context
+  runs low it hands off to a reviewer that is promoted in its place. See
+  [Main/reviewer orchestration](#mainreviewer-orchestration) below.
 
 All cross-session text reaches an agent by being **injected into its context** — at the
 start of each turn (`UserPromptSubmit`) and after every tool call (`PostToolUse`), so
@@ -44,10 +49,11 @@ git clone <repo-url> ~/.claude/hooks   # or anywhere you like
 `install.sh` is idempotent (safe to re-run after pulling updates or moving the repo). It:
 
 1. Checks dependencies (`jq`, `flock`, `git`).
-2. Registers the six hooks in `~/.claude/settings.json` — previous lobby entries are
+2. Registers the seven hooks in `~/.claude/settings.json` — previous lobby entries are
    replaced, everything else is preserved, and a timestamped backup is written first.
-3. Installs the `/btw` and `/room` slash commands into `~/.claude/commands/`, rewritten
-   to point at wherever you cloned the repo.
+3. Installs the `/btw`, `/room`, `/mission`, `/review-request`, `/review-status` and
+   `/handoff` slash commands into `~/.claude/commands/`, rewritten to point at wherever
+   you cloned the repo.
 
 Then copy the [agent protocol block](#teach-your-agents-the-protocol) into your
 `~/.claude/CLAUDE.md` and restart any running Claude Code sessions.
@@ -60,10 +66,11 @@ Then copy the [agent protocol block](#teach-your-agents-the-protocol) into your
 |-------------------|------------------------------------|-----------------------|------|
 | `SessionStart`    | —                                  | `lobby/register.sh`   | Add this session to the lobby (on `compact`/`resume` the existing entry is preserved, heartbeat only). |
 | `UserPromptSubmit`| —                                  | `lobby/inject.sh`     | Heartbeat, clear per-turn claims, inject inbox + other sessions' notes/claims + new room messages. |
-| `PreToolUse`      | `Edit\|Write\|MultiEdit\|NotebookEdit` | `lobby/claim.sh`  | Claim the target file or deny if another session holds it. |
-| `PostToolUse`     | — (all tools)                      | `lobby/post-edit-inbox.sh` | Deliver newly-arrived inbox / room messages mid-execution, after any tool call. |
+| `PreToolUse`      | `Edit\|Write\|MultiEdit\|NotebookEdit` | `lobby/claim.sh`  | Deny edits from reviewers; claim the target file or deny if another session holds it. |
+| `PostToolUse`     | — (all tools)                      | `lobby/post-edit-inbox.sh` | Heartbeat; deliver newly-arrived inbox / room messages mid-execution; warn a main nearing the handoff threshold. |
 | `Stop`            | —                                  | `lobby/release.sh`    | End of turn: release this session's file claims, notify queued waiters, mark session idle. |
-| `SessionEnd`      | —                                  | `lobby/cleanup.sh`    | Remove the session; delete rooms with no members left. |
+| `Stop`            | —                                  | `lobby/stop-gate.sh`  | Role gate: keep reviewers in their wait loop, keep a main working while findings are unresolved, trigger context-overflow succession. |
+| `SessionEnd`      | —                                  | `lobby/cleanup.sh`    | Remove the session; delete rooms with no members left; notify the review room when a main ends. |
 
 Supporting pieces:
 
@@ -74,11 +81,136 @@ Supporting pieces:
 - `lobby/btw.sh` — CLI behind the `/btw` slash command (`send` / `inbox` / `ack` / `show`).
 - `lobby/room.sh` — CLI behind the `/room` slash command (`invite` / `accept` / `say` /
   `leave` / `show` / `list`).
+- `lobby/mission.sh` — CLI for a main's mission: goal text + spec/plan paths (`set` / `show`).
+- `lobby/review.sh` — review state machine (`request` / `verdict` / `status` / `reset`).
+- `lobby/review-wait.sh` — the polling wait loop that keeps reviewers (and a main waiting
+  on a round) awake and returns work packets.
+- `lobby/succession.sh` — promotes a reviewer to main on context-overflow handoff.
 
 - `install.sh` — idempotent installer (hooks + slash commands).
-- `commands/btw.md`, `commands/room.md` — the `/btw` and `/room` slash commands,
-  installed into `~/.claude/commands/`.
+- `commands/*.md` — the `/btw`, `/room`, `/mission`, `/review-request`, `/review-status`
+  and `/handoff` slash commands, installed into `~/.claude/commands/`.
 - `tests/smoke.sh` — end-to-end smoke test simulating two sessions across two repos.
+- `tests/fake-flow.sh` — end-to-end exercise of the main/reviewer workflow with fake
+  sessions (no real Claude needed).
+
+## Main/reviewer orchestration
+
+A role layer on top of the lobby that removes the human from the write→review→fix loop.
+One **main** session does all the writing; up to three **reviewer** sessions are attached
+to it (reviewer→main is 1:1, main→reviewers is 1:many). Reviewers are read-only: their
+file edits are denied at `PreToolUse`, they review and talk in a shared review room.
+
+### Launching
+
+```bash
+LOBBY_ROLE=main claude                                   # the main window
+LOBBY_ROLE=reviewer:1 LOBBY_MAIN=<main-short-id> claude  # reviewer windows (slots 1-3)
+```
+
+The main's short id appears in its injected context (`You are session <short>`). All
+reviewer slots are optional and explicitly numbered; the number picks the lens:
+
+| Slot | Lens | Gets | Charge |
+|------|------|------|--------|
+| R1 | full context | goal + spec + plan | spec/plan compliance, completeness, design intent. **Designated heir** on succession. |
+| R2 | goal-only | goal text only | does the result actually serve the goal? |
+| R3 | blind | the diff only | code quality, readability, correctness in isolation. |
+
+If there is no spec, the lenses degrade gracefully (R1 judges against the goal and
+whatever artifacts exist). Soon after launch, main should register its mission:
+
+```bash
+<repo>/lobby/mission.sh set --session <sid> --goal "..." [--spec <path>] [--plan <path>]
+```
+
+(also `/mission`). This records the review **baseline** (current `HEAD`) that reviewers
+diff against.
+
+### The review loop
+
+1. Main finishes a milestone (spec/plan/code), commits, and runs `/review-request "<summary>"`
+   (`review.sh request`). This opens (or reuses) a review room with all attached
+   reviewers and starts a round.
+2. Reviewers review **sequentially in slot order**. Each gets a packet rendered for its
+   lens (diff since baseline, its slice of the mission, earlier reviewers' findings this
+   round to refute or extend) and records exactly one verdict:
+   `review.sh verdict --verdict approve|request_changes --text "..."`.
+3. When the last reviewer votes: all approve → **approved** (baseline advances, the human
+   is notified via a `systemMessage`); any request-changes → **changes_requested** and
+   main's Stop hook refuses to let it stop until it fixes the findings and re-requests
+   (round + 1). At the round cap (`LOBBY_MAX_ROUNDS`, default 5) the loop **escalates**
+   to the human instead of arguing forever (`review.sh reset` resumes it).
+
+Approval requires at least one explicit `approve` verdict in the round — a round whose
+verdicts were all lost (every voter died mid-round) restarts at the lowest live reviewer
+instead of silently passing.
+
+The whole loop is autonomous; the human only hears about it at approval or escalation.
+
+### How reviewers stay awake
+
+An idle Claude session fires no hooks, so reviewers run `review-wait.sh` in a loop via
+the Bash tool: it heartbeats, polls lobby state, and returns a work packet (your turn to
+review / you've been promoted / your main ended) or `NO_WORK` after `LOBBY_WAIT_TIMEOUT`
+(default 90s), upon which the reviewer runs it again. The reviewer's Stop hook re-arms
+the loop if the model ever drifts. **Trade-off:** reviewer windows are perpetually
+mid-turn, costing a small constant token drip; `LOBBY_REVIEWER_MAX_IDLE_CYCLES`
+(default 240 ≈ 6h of no work) releases them as a backstop.
+
+Roled sessions are exempt from the normal 30-minute stale-prune and use their own much
+longer TTL (`LOBBY_ROLE_STALE_SEC`, default 24h): a main legitimately sits idle while
+the human is away, and pruning it would dissolve the whole orchestration. A crashed
+main (no `SessionEnd`) is therefore detected by reviewers only via the idle-cycle cap.
+
+### Context-overflow succession
+
+Every time main stops, `stop-gate.sh` estimates context usage from the transcript's last
+usage block. At ≥ `LOBBY_HANDOFF_PCT` (default 50%), main is blocked from stopping until
+it (1) writes a handoff brief (state, in-flight work, decisions, next steps) to
+`.claude/handoffs/` and (2) runs `succession.sh handoff`. In one transaction the
+lowest-numbered reviewer becomes the new main (inheriting mission, review state, and
+room), remaining reviewers re-attach to it, and the old main retires — its next stop
+shows the human what happened and the exact command to attach a fresh reviewer on the
+freed slot. The heir's wait loop delivers it the brief and it continues the work.
+`/handoff` triggers the same flow voluntarily. If context usage falls back under the
+threshold before the handoff happens (e.g. auto-compaction), the trigger un-latches and
+the main carries on.
+
+### Loop safety
+
+Every Stop-block either moves the state machine toward a terminal state (approved,
+escalated, retired, main-gone) or bumps a same-reason counter. A session that keeps
+trying to stop without doing its job trips `LOBBY_MAX_SAME_BLOCKS` (default 3) and is
+released with a `systemMessage` instead of spinning. The counter resets on evidence of
+real progress — a successful file claim, a review request or verdict, or a wait-loop
+wake that actually delivered work — so an honest main fixing findings across many turns
+is never cut off, while an idle spinner is. A dead reviewer holding the review turn is
+healed past automatically (`review_self_heal`), a `changes_requested` main whose last
+reviewer died is released to the human instead of being blocked on an impossible
+re-request, and the context estimate fails open (parse failure → no succession).
+
+### Environment variables
+
+| Var | Default | Meaning |
+|-----|---------|---------|
+| `LOBBY_ROLE` | — | `main` or `reviewer:1\|2\|3` at launch |
+| `LOBBY_MAIN` | — | main session id (or prefix) a reviewer attaches to |
+| `LOBBY_HANDOFF_PCT` | 50 | context % that triggers succession |
+| `LOBBY_CTX_LIMIT` | 200000 | token denominator for the context estimate |
+| `LOBBY_MAX_ROUNDS` | 5 | review rounds before escalating to the human |
+| `LOBBY_WAIT_TIMEOUT` / `LOBBY_WAIT_INTERVAL` | 90 / 5 | review-wait return cadence (seconds) |
+| `LOBBY_REVIEWER_MAX_IDLE_CYCLES` | 240 | NO_WORK cycles before a reviewer is released |
+| `LOBBY_MAX_SAME_BLOCKS` | 3 | identical Stop-blocks before the gate gives up and escalates |
+| `LOBBY_ROLE_STALE_SEC` | 86400 | stale-prune TTL for roled sessions (plain sessions: `LOBBY_STALE_AFTER_SEC`, 30 min) |
+
+### Testing
+
+`tests/fake-flow.sh` drives the whole flow (registration, lenses, chain order,
+out-of-turn rejection, stop gating, succession, self-heal, escalation, fail-open
+estimation) with fake sessions piping hook JSON into the scripts — no real Claude
+sessions needed. For a live test, use three terminals (main + R1 + R2) and force
+succession cheaply with `LOBBY_HANDOFF_PCT=1`.
 
 ## Data model
 
@@ -104,7 +236,35 @@ repo root (so sessions launched at different depths in the same repo share state
           "sent_at": "…", "delivered_at": null }
       ],
       "room_id": "r-ab12…",             // current room, if any
-      "room_cursor": 3                   // # of room lines already delivered
+      "room_cursor": 3,                  // # of room lines already delivered
+
+      // role layer (absent on plain sessions — legacy behavior unchanged)
+      "role": "main",                    // "main" | "reviewer" | "retired"
+      "reviewer_no": 1,                  // reviewers only (1..3)
+      "main_sid": "…",                   // reviewers only: full sid of their main
+      "mission": {                       // main only
+        "goal": "ship the widget", "spec_path": null, "plan_path": null
+      },
+      "review": {                        // main only — the review state machine
+        "status": "in_review",           // idle|in_review|changes_requested|approved|escalated
+        "round": 2, "max_rounds": 5,
+        "room_id": "r-rev-…",            // persistent review room
+        "baseline_ref": "<sha>",         // reviewers diff against this; advances on approval
+        "summary": "…", "turn": 2,       // reviewer_no whose turn it is (null between rounds)
+        "requested_at": "…", "notified": false,
+        "findings": [                    // structured verdicts (prose lives in the room)
+          { "round": 1, "reviewer_no": 1, "verdict": "request_changes", "text": "…", "at": "…" }
+        ]
+      },
+      "handoff": {                       // set on a main once succession starts
+        "status": "pending",             // pending|done
+        "brief_path": "…", "notified": false,
+        "heir_sid": "…", "freed_no": 1   // recorded at promotion
+      },
+      "handoff_brief_in": "…",           // on the promoted heir until its wait loop consumes it
+      "idle_cycles": 0,                  // reviewer NO_WORK counter (idle release cap)
+      "stop_blocks": 0,                  // same-reason Stop-block counter (loop safety)
+      "stop_block_sig": "…"
     }
   ],
   "waiters": [                           // claim queue: notified via inbox on release
@@ -112,6 +272,9 @@ repo root (so sessions launched at different depths in the same repo share state
   ]
 }
 ```
+
+Handoff briefs live in `<lobby-anchor>/.claude/handoffs/`; review rooms are ordinary
+room transcripts named `r-rev-*` under `.claude/rooms/`.
 
 - `<lobby-anchor>/.claude/lobby.lock` — `flock` target serializing all writes.
 - `<lobby-anchor>/.claude/rooms/<room_id>.jsonl` — append-only room transcript (one JSON
@@ -268,6 +431,18 @@ Debugging: set `LOBBY_DEBUG_LOG=/some/path` to log every hook invocation (off by
   private only by convention.
 - **Hidden truncation in injection.** Long notes / many planned files are injected verbatim
   with no length budget, which can crowd the agent's context on busy projects.
+- **Reviewer "read-only" is enforced only for the edit tools.** The `PreToolUse` deny covers
+  `Edit|Write|MultiEdit|NotebookEdit`; a reviewer could still write files through `Bash`
+  (`echo > file`, `sed -i`, …). Reviewers are cooperative agents instructed not to edit, so
+  this is a guardrail, not a security boundary.
+- **The review room occupies the single `room_id` slot.** A main or reviewer in the
+  review flow can't simultaneously hold an ad-hoc `/room`; a parallel cursor slot is the
+  future fix if it bites.
+- **Reviewer wake-up is a polling loop, not push.** Reviewer windows stay perpetually
+  mid-turn running `review-wait.sh`; cost is a small token drip, bounded by the idle cap.
+- **A crashed main is detected slowly.** Roled sessions are exempt from the 30-min prune
+  (`LOBBY_ROLE_STALE_SEC` defaults to 24h), so if a main dies without `SessionEnd`, its
+  reviewers keep polling until their idle-cycle cap releases them.
 
 ## Plans to improve
 
