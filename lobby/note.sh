@@ -132,7 +132,7 @@ case "$cmd" in
       lobby_prune
       jq -r '
         .sessions[] |
-        "session " + (.session_id[0:8]) + " (started " + (.started_at // "?") + ")" +
+        "session " + (.session_id[0:8]) + " (" + (.state // "?") + ", started " + (.started_at // "?") + ")" +
         (if ((.note // "") | length) > 0
            then "\n  note: " + .note else "" end) +
         (if ((.plan_path // "") | length) > 0

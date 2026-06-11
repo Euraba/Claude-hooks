@@ -21,16 +21,20 @@ anchors=$(
     jq -r --arg sid "$session_id" '
       (.sessions[]? | select(.session_id == $sid) | .anchors // []) | .[]
     ' "$LOBBY_FILE"
-    lobby_write '
-      .sessions |= map(
+    lobby_write "$LOBBY_JQ_DEFS"'
+      ((.sessions[] | select(.session_id == $sid) | .claims) // []) as $freed
+      | .sessions |= map(
         if .session_id == $sid
         then .claims = []
              | .anchors = []
+             | .state = "idle"
              | .last_seen = $now_iso
              | .last_seen_epoch = ($now | tonumber)
         else . end
       )
-    ' --arg sid "$session_id" --argjson now "$now" --arg now_iso "$now_iso"
+      | notify_waiters($freed; $reason; $now_iso)
+    ' --arg sid "$session_id" --argjson now "$now" --arg now_iso "$now_iso" \
+      --arg reason "(released by ${session_id:0:8})"
   ) 200>"$LOBBY_LOCK"
 )
 

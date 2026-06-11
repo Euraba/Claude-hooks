@@ -44,6 +44,7 @@ if [[ -n "$file_root" && "$file_root" != "$LOBBY_ANCHOR" ]]; then
              started_at: $now_iso,
              last_seen: $now_iso,
              last_seen_epoch: ($now | tonumber),
+             state: "active",
              claims: [],
              anchors: [$anchor]
            }]
@@ -66,22 +67,34 @@ other_claim=$(
     # Fail open on lock contention: no claim check beats stalling every edit.
     flock -w 5 200 || exit 0
     lobby_prune
-    # Is the path claimed by any OTHER live session? Return "<sid>\t<note>"
-    # so the deny reason can include the holder's posted intent.
+    # Is the path claimed by any OTHER live session? Return
+    # "<sid>\t<state>\t<note>" so the deny reason can include the holder's
+    # activity state and posted intent.
     other=$(jq -r --arg sid "$session_id" --arg path "$abs_path" '
       [.sessions[] | select(.session_id != $sid and ((.claims // []) | index($path)))]
-      | if length > 0 then (.[0].session_id + "\t" + (.[0].note // "")) else "" end
+      | if length > 0
+        then (.[0].session_id + "\t" + (.[0].state // "active") + "\t" + (.[0].note // ""))
+        else "" end
     ' "$LOBBY_FILE")
     if [[ -n "$other" ]]; then
+      # Queue this session as a waiter: it gets an inbox notification when
+      # the path is released (Stop, SessionEnd, or stale-prune).
+      lobby_write '
+        .waiters = (((.waiters // []) | map(select((.sid == $sid and .path == $path) | not)))
+                    + [{sid: $sid, path: $path, queued_at: $now_iso}])
+      ' --arg sid "$session_id" --arg path "$abs_path" --arg now_iso "$now_iso"
       printf '%s' "$other"
     else
-      # Record claim + refresh heartbeat. Self-heal if we're not in the lobby.
+      # Record claim + refresh heartbeat; a successful claim also dequeues
+      # any waiter entry we had on this path (we got what we waited for).
+      # Self-heal if we're not in the lobby.
       lobby_write '
         (
           if (.sessions | map(.session_id) | index($sid))
           then .sessions |= map(
                  if .session_id == $sid
                  then .claims = ((.claims // []) + [$path] | unique)
+                      | .state = "active"
                       | .last_seen = $now_iso
                       | .last_seen_epoch = ($now | tonumber)
                  else . end
@@ -91,10 +104,12 @@ other_claim=$(
                  started_at: $now_iso,
                  last_seen: $now_iso,
                  last_seen_epoch: ($now | tonumber),
+                 state: "active",
                  claims: [$path]
                }]
           end
         )
+        | .waiters = ((.waiters // []) | map(select((.sid == $sid and .path == $path) | not)))
       ' --arg sid "$session_id" --arg path "$abs_path" \
         --argjson now "$now" --arg now_iso "$now_iso"
     fi
@@ -102,11 +117,15 @@ other_claim=$(
 )
 
 if [[ -n "$other_claim" ]]; then
-  other_sid="${other_claim%%$'\t'*}"
-  other_note="${other_claim#*$'\t'}"
+  IFS=$'\t' read -r other_sid other_state other_note <<<"$other_claim"
   note_part=""
   [[ -n "$other_note" ]] && note_part=" That session's posted intent: \"$other_note\"."
-  reason="$abs_path is currently claimed by another Claude session (${other_sid:0:8}) in this project.${note_part} Either wait for that session to release it, ask it directly with /btw ${other_sid:0:8} \"<your question>\" (e.g. 'will you modify <method>?'), or ask the user to coordinate."
+  if [[ "$other_state" == "idle" ]]; then
+    state_part=" That session is currently idle (waiting on its user), so a /btw reply may take a while — consider asking the user to coordinate."
+  else
+    state_part=" That session is currently active and will see a /btw after its next tool call."
+  fi
+  reason="$abs_path is currently claimed by another Claude session (${other_sid:0:8}) in this project.${note_part}${state_part} You have been queued and will get an [INBOX] notification when it is released — continue other work in the meantime, or ask directly with /btw ${other_sid:0:8} \"<your question>\" (e.g. 'will you modify <method>?')."
   jq -nc --arg reason "$reason" '{
     hookSpecificOutput: {
       hookEventName: "PreToolUse",

@@ -95,13 +95,45 @@ lobby_write() {
   fi
 }
 
-# Drop sessions whose last_seen_epoch is older than STALE_AFTER_SEC, then
-# collect room transcripts left with no members. Caller holds lock.
+# Shared jq prelude, prepended to filters that release claims.
+# notify_waiters($freed; $reason; $ts): for every queued waiter on a freed
+# path, append a [CLAIM FREED] message to that session's inbox (delivered by
+# the normal inbox machinery, mid-execution) and drop the queue entry.
+LOBBY_JQ_DEFS='
+  def notify_waiters($freed; $reason; $ts):
+    (.waiters // []) as $ws
+    | .sessions |= map(
+        . as $s
+        | ($ws | map(select(.sid == $s.session_id and (.path as $p | $freed | index($p)))) | map(.path)) as $hits
+        | if ($hits | length) > 0
+          then .inbox = ((.inbox // []) + ($hits | map({
+                 from_short: "lobby",
+                 from_full:  "lobby",
+                 text: ("[CLAIM FREED] " + . + " is no longer claimed " + $reason + ". You asked to edit it; you can claim it now."),
+                 sent_at: $ts,
+                 delivered_at: null
+               })))
+          else . end
+      )
+    | .waiters = ((.waiters // []) | map(select((.path as $p | $freed | index($p)) | not)));
+'
+
+# Drop sessions whose last_seen_epoch is older than STALE_AFTER_SEC — notifying
+# queued waiters on the dead sessions' claims and dropping dead sessions' own
+# queue entries — then collect room transcripts left with no members. Caller
+# holds lock.
 lobby_prune() {
-  local now
+  local now now_iso
   now=$(date +%s)
-  lobby_write '.sessions |= map(select(((.last_seen_epoch // 0) | tonumber) > ($now - $ttl)))' \
-    --argjson now "$now" --argjson ttl "$STALE_AFTER_SEC"
+  now_iso=$(date -Iseconds)
+  lobby_write "$LOBBY_JQ_DEFS"'
+    (.sessions | map(select(((.last_seen_epoch // 0) | tonumber) <= ($now - $ttl)))) as $dead
+    | ($dead | map(.claims // []) | add // []) as $freed
+    | ($dead | map(.session_id)) as $deadids
+    | .sessions |= map(select(((.last_seen_epoch // 0) | tonumber) > ($now - $ttl)))
+    | notify_waiters($freed; "(its holder went stale)"; $ts)
+    | .waiters = ((.waiters // []) | map(select((.sid as $i | $deadids | index($i)) | not)))
+  ' --argjson now "$now" --argjson ttl "$STALE_AFTER_SEC" --arg ts "$now_iso"
   lobby_gc_rooms
 }
 
@@ -133,16 +165,25 @@ lobby_gc_rooms() {
 lobby_release_anchor() {
   local sid="$1" anchor="$2" mode="${3:-clear}"
   local dir="$anchor/.claude"
-  local file="$dir/lobby.json" lock="$dir/lobby.lock" tmp
+  local file="$dir/lobby.json" lock="$dir/lobby.lock" tmp reason ts
   [[ -f "$file" ]] || return 0
+  ts=$(date -Iseconds)
+  reason="(released by ${sid:0:8})"
+  [[ "$mode" == "remove" ]] && reason="(its holder session ended)"
   (
     flock -w 5 200 || exit 0
     tmp=$(mktemp "$dir/.lobby.XXXXXX") || exit 0
-    if jq --arg sid "$sid" --arg mode "$mode" '
-         if $mode == "remove"
-         then .sessions |= map(select(.session_id != $sid))
-         else .sessions |= map(if .session_id == $sid then .claims = [] else . end)
-         end
+    if jq --arg sid "$sid" --arg mode "$mode" --arg reason "$reason" --arg ts "$ts" \
+         "$LOBBY_JQ_DEFS"'
+         ((.sessions[] | select(.session_id == $sid) | .claims) // []) as $freed
+         | (if $mode == "remove"
+            then .sessions |= map(select(.session_id != $sid))
+            else .sessions |= map(if .session_id == $sid then .claims = [] else . end)
+            end)
+         | notify_waiters($freed; $reason; $ts)
+         | (if $mode == "remove"
+            then .waiters = ((.waiters // []) | map(select(.sid != $sid)))
+            else . end)
        ' "$file" > "$tmp"; then
       mv "$tmp" "$file"
     else

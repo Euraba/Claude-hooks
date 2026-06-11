@@ -34,6 +34,7 @@ now_iso=$(date -Iseconds)
            started_at: $now_iso,
            last_seen: $now_iso,
            last_seen_epoch: ($now | tonumber),
+           state: "idle",
            claims: []
          }]
     end

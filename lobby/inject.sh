@@ -26,11 +26,13 @@ context=$(
       # Refresh heartbeat, clear this session's per-turn claims, and mark all
       # currently-undelivered inbox messages as delivered (since the next thing
       # the model reads is the injection below, which includes them).
-      lobby_write '
-        .sessions |= map(
+      lobby_write "$LOBBY_JQ_DEFS"'
+        ((.sessions[] | select(.session_id == $sid) | .claims) // []) as $freed
+        | .sessions |= map(
           if .session_id == $sid
           then .last_seen = $now_iso
                | .last_seen_epoch = ($now | tonumber)
+               | .state = "active"
                | .claims = []
                | .inbox = ((.inbox // []) | map(
                    if (.delivered_at // null) == null
@@ -39,7 +41,9 @@ context=$(
                  ))
           else . end
         )
-      ' --arg sid "$session_id" --argjson now "$now" --arg now_iso "$now_iso"
+        | notify_waiters($freed; $reason; $now_iso)
+      ' --arg sid "$session_id" --argjson now "$now" --arg now_iso "$now_iso" \
+        --arg reason "(released by ${session_id:0:8})"
     fi
     # Build context: 1) my own pending inbox (loud, at top), then 2) OTHER
     # sessions' claims/notes/planned_files. Always lead with this session's
@@ -68,7 +72,7 @@ context=$(
           (if ($others | length) > 0 then
              "\nOther active Claude sessions in this project:\n" +
              ($others | map(
-               "- session " + (.session_id[0:8]) + " (started " + (.started_at // "?") + ")" +
+               "- session " + (.session_id[0:8]) + " (" + (.state // "?") + ", started " + (.started_at // "?") + ")" +
                (if ((.note          // "") | length) > 0
                   then "\n    note: \"" + .note + "\"" else "" end) +
                (if ((.plan_path     // "") | length) > 0

@@ -10,6 +10,7 @@ session_id=$(jq -r '.session_id // empty' <<<"$input")
 [[ -z "$session_id" ]] && exit 0
 
 ROOMS_DIR="$LOBBY_DIR/rooms"
+now_iso=$(date -Iseconds)
 
 anchors=$(
   (
@@ -23,7 +24,12 @@ anchors=$(
       (.sessions[]? | select(.session_id == $sid) | .anchors // []) | .[]
     ' "$LOBBY_FILE"
 
-    lobby_write '.sessions |= map(select(.session_id != $sid))' --arg sid "$session_id"
+    lobby_write "$LOBBY_JQ_DEFS"'
+      ((.sessions[] | select(.session_id == $sid) | .claims) // []) as $freed
+      | .sessions |= map(select(.session_id != $sid))
+      | notify_waiters($freed; "(its holder session ended)"; $ts)
+      | .waiters = ((.waiters // []) | map(select(.sid != $sid)))
+    ' --arg sid "$session_id" --arg ts "$now_iso"
 
     if [[ -n "$leaving_room" ]]; then
       members=$(jq -r --arg room "$leaving_room" '[.sessions[] | select(.room_id == $room)] | length' "$LOBBY_FILE")

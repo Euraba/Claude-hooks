@@ -30,6 +30,10 @@ check "SA claim foo.ts allowed (no output)" test -z "$out"
 out=$(echo "{\"session_id\":\"$SB\",\"tool_input\":{\"file_path\":\"$T/repoA/foo.ts\"}}" | "$H/claim.sh")
 check "SB claim foo.ts denied" grep -q '"permissionDecision":"deny"' <<<"$out"
 check "deny reason includes holder's note" grep -q "refactoring foo module" <<<"$out"
+check "deny reason shows holder is active" grep -q "currently active" <<<"$out"
+check "deny reason says queued" grep -q "queued" <<<"$out"
+check "waiter registered for SB" jq -e --arg p "$T/repoA/foo.ts" \
+  '.waiters[] | select(.sid == "'$SB'" and .path == $p)' "$A_LOBBY"
 "$H/note.sh" clear --session "$SA"
 
 echo "=== bug 1: cross-repo claim + release ==="
@@ -46,6 +50,14 @@ check "home anchors cleared on Stop" jq -e \
   '.sessions[] | select(.session_id == "'$SA'") | (.anchors // []) == []' "$A_LOBBY"
 check "FOREIGN claims cleared on Stop" jq -e \
   '.sessions[] | select(.session_id == "'$SA'") | .claims == []' "$B_LOBBY"
+
+echo "=== claim queueing: waiter notified on release ==="
+check "SB got [CLAIM FREED] notification" jq -e --arg p "$T/repoA/foo.ts" \
+  '.sessions[] | select(.session_id == "'$SB'")
+   | .inbox | map(select((.text | contains("[CLAIM FREED]")) and (.text | contains($p)))) | length == 1' "$A_LOBBY"
+check "waiter dequeued after notification" jq -e '(.waiters // []) | length == 0' "$A_LOBBY"
+out=$(echo "{\"session_id\":\"$SB\",\"tool_input\":{\"file_path\":\"$T/repoA/foo.ts\"}}" | "$H/claim.sh")
+check "SB can claim foo.ts after release" test -z "$out"
 
 echo "=== bug 2: send must not refresh recipient heartbeat ==="
 before=$(jq -r '.sessions[] | select(.session_id == "'$SB'") | .last_seen_epoch' "$A_LOBBY")
@@ -102,6 +114,19 @@ check "orphan room file GC'd" bash -c "! test -e $T/repoA/.claude/rooms/r-dead00
 echo '{"system":true,"text":"fresh"}' > "$T/repoA/.claude/rooms/r-fresh0.jsonl"
 echo "{\"session_id\":\"$SA\"}" | "$H/inject.sh" >/dev/null
 check "fresh (<60s) room file NOT GC'd" test -e "$T/repoA/.claude/rooms/r-fresh0.jsonl"
+
+echo "=== presence: state transitions ==="
+SC=eeee5555-5555-5555-5555-555555555555
+echo "{\"session_id\":\"$SC\",\"source\":\"startup\"}" | "$H/register.sh"
+check "state idle after register" jq -e \
+  '.sessions[] | select(.session_id == "'$SC'") | .state == "idle"' "$A_LOBBY"
+echo "{\"session_id\":\"$SC\"}" | "$H/inject.sh" >/dev/null
+check "state active after prompt" jq -e \
+  '.sessions[] | select(.session_id == "'$SC'") | .state == "active"' "$A_LOBBY"
+echo "{\"session_id\":\"$SC\"}" | "$H/release.sh"
+check "state idle after Stop" jq -e \
+  '.sessions[] | select(.session_id == "'$SC'") | .state == "idle"' "$A_LOBBY"
+echo "{\"session_id\":\"$SC\"}" | "$H/cleanup.sh"
 
 echo "=== cleanup: SessionEnd removes session from foreign lobby too ==="
 echo "{\"session_id\":\"$SA\",\"tool_input\":{\"file_path\":\"$T/repoB/baz.ts\"}}" | "$H/claim.sh" >/dev/null

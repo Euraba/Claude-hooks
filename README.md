@@ -14,10 +14,15 @@ coordination this turn" rather than stalling every hook and tool call.
 ## What it does
 
 - **Presence** — every session registers itself on start and heartbeats each turn, so
-  each agent can see who else is active in the project.
+  each agent can see who else is in the project and whether each session is currently
+  `active` (mid-turn) or `idle` (waiting on its user).
 - **File claims** — when an agent is about to `Edit`/`Write` a file, that file is claimed
   for the current turn. If another live session already holds the claim, the edit is
-  **denied** with a reason telling the agent who holds it and how to ask them about it.
+  **denied** with a reason telling the agent who holds it, that session's posted intent
+  and activity state, and how to ask it about the file.
+- **Claim queueing** — a denied session is queued automatically and receives an inbox
+  notification the moment the file is released (turn end, session end, or stale-prune),
+  so it can continue other work instead of retrying blind.
 - **Intent notes** — an agent can post a one-line "what I'm working on", a plan path, and
   the files it expects to touch, which surfaces to other sessions.
 - **`/btw` inbox messaging** — fire-and-forget questions to one session or all sessions.
@@ -57,7 +62,7 @@ Then copy the [agent protocol block](#teach-your-agents-the-protocol) into your
 | `UserPromptSubmit`| —                                  | `lobby/inject.sh`     | Heartbeat, clear per-turn claims, inject inbox + other sessions' notes/claims + new room messages. |
 | `PreToolUse`      | `Edit\|Write\|MultiEdit\|NotebookEdit` | `lobby/claim.sh`  | Claim the target file or deny if another session holds it. |
 | `PostToolUse`     | — (all tools)                      | `lobby/post-edit-inbox.sh` | Deliver newly-arrived inbox / room messages mid-execution, after any tool call. |
-| `Stop`            | —                                  | `lobby/release.sh`    | End of turn: release this session's file claims. |
+| `Stop`            | —                                  | `lobby/release.sh`    | End of turn: release this session's file claims, notify queued waiters, mark session idle. |
 | `SessionEnd`      | —                                  | `lobby/cleanup.sh`    | Remove the session; delete rooms with no members left. |
 
 Supporting pieces:
@@ -90,6 +95,7 @@ repo root (so sessions launched at different depths in the same repo share state
       "last_seen_epoch": 1748…,         // used for stale-pruning
       "claims": ["/abs/path/a.ts"],     // files held THIS turn; cleared on Stop
       "anchors": ["/other/repo"],       // foreign repo roots this session claimed files in
+      "state": "active",                // "active" = mid-turn; "idle" = waiting on its user
       "note": "refactoring auth",       // optional intent
       "plan_path": "…",                 // optional
       "planned_files": ["/abs/…"],      // optional
@@ -100,6 +106,9 @@ repo root (so sessions launched at different depths in the same repo share state
       "room_id": "r-ab12…",             // current room, if any
       "room_cursor": 3                   // # of room lines already delivered
     }
+  ],
+  "waiters": [                           // claim queue: notified via inbox on release
+    { "sid": "…", "path": "/abs/…", "queued_at": "…" }
   ]
 }
 ```
@@ -111,9 +120,10 @@ repo root (so sessions launched at different depths in the same repo share state
 Claims are **per-turn** (cleared on `Stop` and at the next `UserPromptSubmit`), representing
 "actively editing right now". A claim on a file in a *different* git repo than the session's
 home anchor is recorded in that repo's lobby; the foreign repo root is tracked in `anchors`
-on the home entry so `Stop`/`SessionEnd` release those claims too. Notes/inbox/room
-membership are **per-session** and persist until `SessionEnd` or stale-prune (default 30 min
-idle, `LOBBY_STALE_AFTER_SEC`).
+on the home entry so `Stop`/`SessionEnd` release those claims too. A session denied a claim
+is queued under `waiters` and gets a `[CLAIM FREED]` inbox notification when the path is
+released, whichever way that happens. Notes/inbox/room membership are **per-session** and
+persist until `SessionEnd` or stale-prune (default 30 min idle, `LOBBY_STALE_AFTER_SEC`).
 
 ## Usage (from inside a session)
 
@@ -180,8 +190,10 @@ touching:
 ### Asking another session a question (/btw)
 
 If a file Edit/Write is denied because another session has claimed the file (the
-`PreToolUse` deny reason mentions a session short id), do NOT just give up. Use
-`/btw` to ask that session what it intends:
+`PreToolUse` deny reason mentions a session short id), do NOT just give up — you
+are queued automatically and will get an `[INBOX]` notification when the file is
+freed, so continue other work in the meantime. If you need an answer sooner, use
+`/btw` to ask the holding session what it intends:
 
     /btw <other_short_id> Will you modify <method/symbol> in <file>? I need to <reason>.
 
