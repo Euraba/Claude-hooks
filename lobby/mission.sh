@@ -56,7 +56,7 @@ case "$cmd" in
     set_plan_b=$([[ $has_plan -eq 1 ]] && echo true || echo false)
 
     (
-      flock 200
+      flock -w 10 200 || { echo "mission.sh: lobby lock busy, try again" >&2; exit 4; }
       lobby_prune
       lobby_write '
         .sessions |= map(
@@ -84,7 +84,7 @@ case "$cmd" in
 
   show)
     (
-      flock 200
+      flock -w 10 200 || { echo "mission.sh: lobby lock busy, try again" >&2; exit 4; }
       lobby_prune
       jq -r '
         [.sessions[] | select(.role == "main")]

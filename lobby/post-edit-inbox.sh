@@ -45,21 +45,22 @@ context=$(
         end
     ' "$LOBBY_FILE")
 
-    if [[ -n "$undelivered" ]]; then
-      lobby_write '
-        .sessions |= map(
-          if .session_id == $sid
-          then .inbox = ((.inbox // []) | map(
-                 if (.delivered_at // null) == null
-                 then .delivered_at = $now_iso
-                 else . end
-               ))
-               | .last_seen = $now_iso
-               | .last_seen_epoch = ($now | tonumber)
-          else . end
-        )
-      ' --arg sid "$session_id" --arg now_iso "$now_iso" --argjson now "$now"
-    fi
+    # Always heartbeat: this hook fires after every tool call, so a session
+    # deep in a long read-only stretch (e.g. a reviewer studying a diff)
+    # stays fresh instead of drifting toward the stale-prune TTL.
+    lobby_write '
+      .sessions |= map(
+        if .session_id == $sid
+        then .inbox = ((.inbox // []) | map(
+               if (.delivered_at // null) == null
+               then .delivered_at = $now_iso
+               else . end
+             ))
+             | .last_seen = $now_iso
+             | .last_seen_epoch = ($now | tonumber)
+        else . end
+      )
+    ' --arg sid "$session_id" --arg now_iso "$now_iso" --argjson now "$now"
     room_new=$(room_deliver_new "$session_id")
 
     # Advisory context warning for mains nearing the handoff threshold. The

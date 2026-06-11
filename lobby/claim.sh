@@ -117,6 +117,10 @@ other_claim=$(
                       | .state = "active"
                       | .last_seen = $now_iso
                       | .last_seen_epoch = ($now | tonumber)
+                      # A successful claim is real progress: a main fixing
+                      # findings across many turns must not trip the
+                      # same-reason Stop-block cap.
+                      | .stop_blocks = 0
                  else . end
                )
           else .sessions += [{

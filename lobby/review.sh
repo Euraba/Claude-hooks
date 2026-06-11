@@ -53,7 +53,7 @@ case "$cmd" in
     head_ref=$(git -C "$LOBBY_ANCHOR" rev-parse HEAD 2>/dev/null || true)
 
     (
-      flock 200
+      flock -w 10 200 || { echo "review.sh request: lobby lock busy, try again" >&2; exit 4; }
       lobby_prune
 
       role=$(session_field "$sid_full" '.role')
@@ -115,6 +115,7 @@ case "$cmd" in
                  | .findings = (.findings // []))
              | .last_seen = $now_iso
              | .last_seen_epoch = ($now | tonumber)
+             | .stop_blocks = 0
           else . end
         )
       ' --arg main "$sid_full" --arg room "$room" --arg summary "$summary" \
@@ -152,7 +153,7 @@ case "$cmd" in
     now_iso=$(date -Iseconds)
 
     (
-      flock 200
+      flock -w 10 200 || { echo "review.sh verdict: lobby lock busy, try again" >&2; exit 4; }
       lobby_prune
 
       role=$(session_field "$sid_full" '.role')
@@ -196,6 +197,7 @@ case "$cmd" in
         .sessions |= map(
           if .session_id == $sid then .room_cursor = ($n | tonumber)
              | .last_seen = $now_iso | .last_seen_epoch = ($now | tonumber)
+             | .stop_blocks = 0
           else . end
         )
       ' --arg sid "$sid_full" --argjson n "$total" --arg now_iso "$now_iso" --argjson now "$now"
@@ -214,7 +216,7 @@ case "$cmd" in
 
   status)
     (
-      flock 200
+      flock -w 10 200 || { echo "review.sh status: lobby lock busy, try again" >&2; exit 4; }
       lobby_prune
       jq -r '
         [.sessions[] | select(.role == "main")] as $mains
@@ -240,8 +242,12 @@ case "$cmd" in
     sid_full=$(resolve_sid "$session_id")
     [[ -z "$sid_full" ]] && { echo "review.sh reset: --session '$session_id' did not match" >&2; exit 2; }
     (
-      flock 200
+      flock -w 10 200 || { echo "review.sh reset: lobby lock busy, try again" >&2; exit 4; }
       status=$(session_field "$sid_full" '.review.status')
+      if [[ "$status" != "escalated" ]]; then
+        echo "review.sh reset: review is '${status:-idle}', not escalated — nothing to reset. (reset re-arms a deadlocked review; to start a new round use review.sh request.)" >&2
+        exit 3
+      fi
       round=$(session_field "$sid_full" '.review.round')
       new_max="${max_rounds_arg:-$(( ${round:-0} + 5 ))}"
       lobby_write '

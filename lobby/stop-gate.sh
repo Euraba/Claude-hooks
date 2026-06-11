@@ -101,11 +101,21 @@ gate_decide() {
   # ---- role == main ----------------------------------------------------------
 
   # Succession first: a main past the context threshold must hand off before
-  # doing anything else. Latched once via handoff.status.
+  # doing anything else. Latched via handoff.status — but the latch re-checks
+  # the estimate: auto-compaction can shrink context back under the threshold,
+  # and a main must not be forced into a handoff it no longer needs. The latch
+  # is kept when the estimate is unavailable (fail toward the safer state).
   handoff_status=$(session_field "$session_id" '.handoff.status')
   if [[ "$handoff_status" != "done" ]]; then
     has_reviewer=$(next_reviewer_no "$session_id" 0)
     pct=$(estimate_ctx_pct "$transcript_path")
+    if [[ "$handoff_status" == "pending" && -n "$pct" && "$pct" -lt "$HANDOFF_PCT" ]]; then
+      lobby_write '
+        .sessions |= map(if .session_id == $sid then del(.handoff) else . end)
+      ' --arg sid "$session_id"
+      printf 'SYS %s\n' "$(enc "lobby: main $short is back at ${pct}% context (compaction?) — pending handoff cancelled.")"
+      handoff_status=""
+    fi
     if [[ "$handoff_status" == "pending" || ( -n "$pct" && -n "$has_reviewer" && "$pct" -ge "$HANDOFF_PCT" ) ]]; then
       if [[ -n "$has_reviewer" ]]; then
         brief_path=$(session_field "$session_id" '.handoff.brief_path')
@@ -136,6 +146,19 @@ gate_decide() {
   status=$(session_field "$session_id" '.review.status')
   case "$status" in
     changes_requested)
+      # With no live reviewers left, "fix and re-request" is impossible —
+      # escalate to the human instead of blocking on it.
+      if [[ -z "$(next_reviewer_no "$session_id" 0)" ]]; then
+        lobby_write '
+          .sessions |= map(
+            if .session_id == $sid
+            then .review.status = "escalated" | .review.notified = true
+            else . end
+          )
+        ' --arg sid "$session_id"
+        printf 'SYS %s\n' "$(enc "lobby: main $short has unresolved review findings but all its reviewers are gone — escalating to you. Attach a new reviewer (LOBBY_ROLE=reviewer:1 LOBBY_MAIN=$short claude) and run $HOOKS_DIR/review.sh reset --session $short to resume, or take over manually.")"
+        exit 0
+      fi
       round=$(session_field "$session_id" '.review.round')
       maxr=$(session_field "$session_id" '.review.max_rounds')
       findings=$(jq -r --arg sid "$session_id" '
@@ -189,7 +212,9 @@ Fix these, commit, then start round $((${round:-0}+1))/${maxr:-5} with: $HOOKS_D
 
 out=$(
   (
-    flock 200
+    # Fail open on lock contention: a missed gate decision beats a hung Stop
+    # hook freezing the session.
+    flock -w 5 200 || exit 0
     gate_decide
   ) 200>"$LOBBY_LOCK"
 )

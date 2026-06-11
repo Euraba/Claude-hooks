@@ -49,7 +49,7 @@ short="${sid_full:0:8}"
 
 result=$(
 (
-  flock 200
+  flock -w 10 200 || { echo "ERR lobby lock busy, run the handoff command again"; exit 4; }
   lobby_prune
 
   role=$(session_field "$sid_full" '.role')

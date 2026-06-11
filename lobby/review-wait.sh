@@ -124,16 +124,18 @@ while :; do
   # One locked pass: heartbeat, self-heal, collect chatter, check wake conditions.
   out=$(
   (
-    flock 200
+    # Fail open on lock contention: skip this poll, the loop retries.
+    flock -w 5 200 || exit 0
     lobby_prune
     now=$(date +%s); now_iso=$(date -Iseconds)
-    # Heartbeat; also reset the Stop-gate's same-reason block counter — running
-    # this script is the proof that the session is obeying its loop.
+    # Heartbeat only. Deliberately NOT resetting stop_blocks here: merely
+    # polling is not progress, and an unconditional reset would let a session
+    # alternate review-wait <-> stop forever without ever tripping the
+    # same-reason cap. The counter resets when a wake delivers real work.
     lobby_write '
       .sessions |= map(
         if .session_id == $sid
         then .last_seen = $now_iso | .last_seen_epoch = ($now | tonumber)
-           | .stop_blocks = 0
         else . end
       )
     ' --arg sid "$sid_full" --arg now_iso "$now_iso" --argjson now "$now"
@@ -176,11 +178,13 @@ while :; do
       if [[ -n "$brief_in" ]]; then
         printf 'WAKE PROMOTED %s\n' "$brief_in"
         lobby_write '
-          .sessions |= map(if .session_id == $sid then .handoff_brief_in = null | .idle_cycles = 0 else . end)
+          .sessions |= map(if .session_id == $sid then .handoff_brief_in = null | .idle_cycles = 0 | .stop_blocks = 0 else . end)
         ' --arg sid "$sid_full"
       else
         status=$(session_field "$sid_full" '.review.status')
         if [[ -n "$status" && "$status" != "in_review" ]]; then
+          # No stop_blocks reset here: re-reading an unresolved result is not
+          # progress for a main. Fixing (claims) or re-requesting resets it.
           printf 'WAKE MAIN_RESULT %s %s\n' "$status" "$(session_field "$sid_full" '.review.round')"
           lobby_write '
             .sessions |= map(if .session_id == $sid then .idle_cycles = 0 else . end)
@@ -198,10 +202,12 @@ while :; do
         if [[ "$status" == "in_review" && "$turn" == "$my_no" ]]; then
           printf 'WAKE REVIEW %s %s\n' "$main_sid" "$my_no"
           lobby_write '
-            .sessions |= map(if .session_id == $sid then .idle_cycles = 0 else . end)
+            .sessions |= map(if .session_id == $sid then .idle_cycles = 0 | .stop_blocks = 0 else . end)
           ' --arg sid "$sid_full"
         fi
       fi
+    elif [[ "$role" == "retired" ]]; then
+      printf 'WAKE RETIRED\n'
     else
       printf 'WAKE NO_ROLE\n'
     fi
@@ -239,14 +245,17 @@ EOF
         ;;
       REVIEW)
         set -- $wake   # REVIEW <main_sid> <my_no> — no spaces in either
-        ( flock 200; build_review_packet "$2" "$3" ) 200>"$LOBBY_LOCK"
+        ( flock -w 10 200 || exit 0; build_review_packet "$2" "$3" ) 200>"$LOBBY_LOCK"
         ;;
       MAIN_GONE)
         echo "MAIN_GONE — your main session ended without promoting you. Your review duties are over; you may stop now and tell the user."
         ;;
       MAIN_RESULT)
         set -- $wake   # MAIN_RESULT <status> <round>
-        ( flock 200; build_main_result "$2" "$3" ) 200>"$LOBBY_LOCK"
+        ( flock -w 10 200 || exit 0; build_main_result "$2" "$3" ) 200>"$LOBBY_LOCK"
+        ;;
+      RETIRED)
+        echo "RETIRED — you already handed off to your heir; your duties here are done. Tell the user what happened and stop (your Stop hook shows the handoff details)."
         ;;
       NO_ROLE)
         echo "NO_ROLE — this session has no lobby role; review-wait does not apply. Stop running it."
@@ -255,15 +264,43 @@ EOF
     exit 0
   fi
 
+  # Chatter with no wake: return it immediately rather than sitting on
+  # messages that were already marked delivered — if this process dies
+  # mid-loop they would otherwise be lost unseen.
+  if [[ -n "$chatter" ]]; then
+    (
+      flock -w 5 200 || exit 0
+      lobby_write '
+        .sessions |= map(
+          if .session_id == $sid
+          then .idle_cycles = 0
+             | (if .role == "reviewer" then .stop_blocks = 0 else . end)
+          else . end
+        )
+      ' --arg sid "$sid_full"
+    ) 200>"$LOBBY_LOCK"
+    printf '%s\n' "$chatter"
+    echo "MESSAGES — handle the above (reply via $HOOKS_DIR/room.sh say or $HOOKS_DIR/btw.sh send as appropriate), then run $HOOKS_DIR/review-wait.sh --session $sid_full again now."
+    exit 0
+  fi
+
   if (( elapsed + interval > timeout )); then
     # Timed out: count the idle cycle and hand back a re-run instruction.
     (
-      flock 200
+      flock -w 5 200 || exit 0
+      # For a REVIEWER, completing a poll cycle is proof of obedience — its
+      # Stop-block is a keep-alive, bounded separately by idle_cycles. For a
+      # MAIN the counter must NOT reset on mere polling (progress resets it:
+      # claims, request, verdict), or the same-reason cap could never trip.
       lobby_write '
-        .sessions |= map(if .session_id == $sid then .idle_cycles = ((.idle_cycles // 0) + 1) else . end)
+        .sessions |= map(
+          if .session_id == $sid
+          then .idle_cycles = ((.idle_cycles // 0) + 1)
+             | (if .role == "reviewer" then .stop_blocks = 0 else . end)
+          else . end
+        )
       ' --arg sid "$sid_full"
     ) 200>"$LOBBY_LOCK"
-    [[ -n "$chatter" ]] && printf '%s\n' "$chatter"
     role=$(session_field "$sid_full" '.role')
     if [[ "$role" == "reviewer" ]]; then
       msid=$(session_field "$sid_full" '.main_sid')
