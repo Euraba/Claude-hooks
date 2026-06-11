@@ -13,17 +13,30 @@ session_id=$(jq -r '.session_id // empty' <<<"$input")
 now=$(date +%s)
 now_iso=$(date -Iseconds)
 
-(
-  flock 200
-  lobby_write '
-    .sessions |= map(
-      if .session_id == $sid
-      then .claims = []
-           | .last_seen = $now_iso
-           | .last_seen_epoch = ($now | tonumber)
-      else . end
-    )
-  ' --arg sid "$session_id" --argjson now "$now" --arg now_iso "$now_iso"
-) 200>"$LOBBY_LOCK"
+anchors=$(
+  (
+    flock -w 5 200 || exit 0
+    # Print foreign anchors (repos this session claimed files in via
+    # claim.sh re-anchoring) before clearing them along with the claims.
+    jq -r --arg sid "$session_id" '
+      (.sessions[]? | select(.session_id == $sid) | .anchors // []) | .[]
+    ' "$LOBBY_FILE"
+    lobby_write '
+      .sessions |= map(
+        if .session_id == $sid
+        then .claims = []
+             | .anchors = []
+             | .last_seen = $now_iso
+             | .last_seen_epoch = ($now | tonumber)
+        else . end
+      )
+    ' --arg sid "$session_id" --argjson now "$now" --arg now_iso "$now_iso"
+  ) 200>"$LOBBY_LOCK"
+)
+
+# Release claims recorded in other repos' lobbies (each takes its own lock).
+while IFS= read -r anchor; do
+  [[ -n "$anchor" ]] && lobby_release_anchor "$session_id" "$anchor" clear
+done <<<"$anchors"
 
 exit 0

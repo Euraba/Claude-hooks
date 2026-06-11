@@ -16,7 +16,8 @@ now_iso=$(date -Iseconds)
 
 context=$(
   (
-    flock 200
+    # Fail open on lock contention: inject nothing rather than stall the turn.
+    flock -w 5 200 || exit 0
     lobby_prune
     # New turn: refresh own heartbeat AND clear this session's claims.
     # Claims represent "actively working on it this turn", not session-lifetime

@@ -63,7 +63,7 @@ append_room_line() {
   local room="$1"; local payload="$2"
   local f="$ROOMS_DIR/$room.jsonl"
   (
-    flock 201
+    flock -w 5 201 || exit 1
     printf '%s\n' "$payload" >> "$f"
   ) 201>"$f.lock"
 }
@@ -91,7 +91,7 @@ case "$cmd" in
 
     # Set inviter's room_id and cursor=1 (they've already "seen" the open line).
     (
-      flock 200
+      flock -w 5 200 || { echo "room.sh invite: lobby lock busy, try again" >&2; exit 1; }
       lobby_prune
       lobby_write '
         .sessions |= map(
@@ -103,7 +103,7 @@ case "$cmd" in
           else . end
         )
       ' --arg sid "$from_full" --arg room "$room_id" --arg now_iso "$now_iso" --argjson now "$now"
-    ) 200>"$LOBBY_LOCK"
+    ) 200>"$LOBBY_LOCK" || exit 1
 
     # Notify invitee via inbox.
     invite_msg="[ROOM INVITE] ${from_short} invites you to room ${room_id}"
@@ -124,11 +124,14 @@ case "$cmd" in
 
     now_iso=$(date -Iseconds); now=$(date +%s)
     short="${sid_full:0:8}"
-    append_room_line "$room_id" "$(jq -nc --arg ts "$now_iso" --arg s "$short" '{system: true, text: ($s + " joined"), ts: $ts}')"
 
     # Set room_id; cursor=0 so the invitee sees the opening line + topic.
+    # Membership is written before the "joined" line, and the existence check
+    # is repeated under the lock, so a concurrent leave can't delete the room
+    # between our check above and the join.
     (
-      flock 200
+      flock -w 5 200 || { echo "room.sh accept: lobby lock busy, try again" >&2; exit 1; }
+      [[ -f "$ROOMS_DIR/$room_id.jsonl" ]] || { echo "room.sh accept: room $room_id no longer exists" >&2; exit 1; }
       lobby_write '
         .sessions |= map(
           if .session_id == $sid
@@ -139,8 +142,9 @@ case "$cmd" in
           else . end
         )
       ' --arg sid "$sid_full" --arg room "$room_id" --arg now_iso "$now_iso" --argjson now "$now"
-    ) 200>"$LOBBY_LOCK"
+    ) 200>"$LOBBY_LOCK" || exit 1
 
+    append_room_line "$room_id" "$(jq -nc --arg ts "$now_iso" --arg s "$short" '{system: true, text: ($s + " joined"), ts: $ts}')"
     echo "joined $room_id"
     ;;
 
@@ -150,19 +154,13 @@ case "$cmd" in
     room=$(session_room "$sid_full"); [[ -z "$room" ]] && { echo "room.sh say: not in a room" >&2; exit 2; }
 
     now_iso=$(date -Iseconds); short="${sid_full:0:8}"
+    # No cursor update here: jumping the cursor to the current line count
+    # could skip over a message the other member appended just before ours.
+    # room_deliver_new advances the cursor and filters out our own lines.
     append_room_line "$room" "$(jq -nc \
       --arg from_short "$short" --arg from_full "$sid_full" --arg text "$text" --arg ts "$now_iso" \
-      '{from_short: $from_short, from_full: $from_full, text: $text, ts: $ts}')"
-    # Refresh sender's cursor so they don't see their own line as "new".
-    lines=$(wc -l < "$ROOMS_DIR/$room.jsonl")
-    (
-      flock 200
-      lobby_write '
-        .sessions |= map(
-          if .session_id == $sid then .room_cursor = ($n | tonumber) else . end
-        )
-      ' --arg sid "$sid_full" --argjson n "$lines"
-    ) 200>"$LOBBY_LOCK"
+      '{from_short: $from_short, from_full: $from_full, text: $text, ts: $ts}')" \
+      || { echo "room.sh say: could not append to room transcript" >&2; exit 1; }
     ;;
 
   leave)
@@ -174,19 +172,19 @@ case "$cmd" in
     append_room_line "$room" "$(jq -nc --arg ts "$now_iso" --arg s "$short" '{system: true, text: ($s + " left"), ts: $ts}')"
 
     (
-      flock 200
+      flock -w 5 200 || { echo "room.sh leave: lobby lock busy, try again" >&2; exit 1; }
       lobby_write '
         .sessions |= map(
           if .session_id == $sid then .room_id = null | .room_cursor = 0 else . end
         )
       ' --arg sid "$sid_full"
-    ) 200>"$LOBBY_LOCK"
-
-    # If no other session is still in this room, delete the file.
-    members=$(jq -r --arg room "$room" '[.sessions[] | select(.room_id == $room)] | length' "$LOBBY_FILE")
-    if [[ "$members" -eq 0 ]]; then
-      rm -f "$ROOMS_DIR/$room.jsonl" "$ROOMS_DIR/$room.jsonl.lock"
-    fi
+      # Check membership and delete while still holding the lock, so a
+      # concurrent accept can't join a room we're about to remove.
+      members=$(jq -r --arg room "$room" '[.sessions[] | select(.room_id == $room)] | length' "$LOBBY_FILE")
+      if [[ "$members" -eq 0 ]]; then
+        rm -f "$ROOMS_DIR/$room.jsonl" "$ROOMS_DIR/$room.jsonl.lock"
+      fi
+    ) 200>"$LOBBY_LOCK" || exit 1
     echo "left $room"
     ;;
 

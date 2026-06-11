@@ -82,12 +82,60 @@ lobby_write() {
   fi
 }
 
-# Drop sessions whose last_seen_epoch is older than STALE_AFTER_SEC. Caller holds lock.
+# Drop sessions whose last_seen_epoch is older than STALE_AFTER_SEC, then
+# collect room transcripts left with no members. Caller holds lock.
 lobby_prune() {
   local now
   now=$(date +%s)
   lobby_write '.sessions |= map(select(((.last_seen_epoch // 0) | tonumber) > ($now - $ttl)))' \
     --argjson now "$now" --argjson ttl "$STALE_AFTER_SEC"
+  lobby_gc_rooms
+}
+
+# Delete room files whose room_id has no remaining member (e.g. the last
+# member was stale-pruned, so neither leave nor SessionEnd ran). Files
+# younger than 60s are skipped: invite creates the transcript before taking
+# the lobby lock to record membership, so a brand-new room briefly has no
+# member on record. Caller holds lock.
+lobby_gc_rooms() {
+  local rooms_dir="$LOBBY_DIR/rooms" f room mtime now
+  [[ -d "$rooms_dir" ]] || return 0
+  now=$(date +%s)
+  for f in "$rooms_dir"/*.jsonl; do
+    [[ -e "$f" ]] || break
+    mtime=$(stat -c %Y "$f" 2>/dev/null) || continue
+    (( now - mtime < 60 )) && continue
+    room=$(basename "$f" .jsonl)
+    if [[ $(jq -r --arg room "$room" \
+          '[.sessions[] | select((.room_id // "") == $room)] | length' "$LOBBY_FILE") -eq 0 ]]; then
+      rm -f "$f" "$f.lock"
+    fi
+  done
+}
+
+# Clear session $1's claims in the lobby anchored at $2 (mode "clear"), or
+# remove its entry entirely (mode "remove"). Used for claims recorded in a
+# different git repo than the session's home anchor. Takes that lobby's own
+# lock; must NOT be called while holding another lobby lock.
+lobby_release_anchor() {
+  local sid="$1" anchor="$2" mode="${3:-clear}"
+  local dir="$anchor/.claude"
+  local file="$dir/lobby.json" lock="$dir/lobby.lock" tmp
+  [[ -f "$file" ]] || return 0
+  (
+    flock -w 5 200 || exit 0
+    tmp=$(mktemp "$dir/.lobby.XXXXXX") || exit 0
+    if jq --arg sid "$sid" --arg mode "$mode" '
+         if $mode == "remove"
+         then .sessions |= map(select(.session_id != $sid))
+         else .sessions |= map(if .session_id == $sid then .claims = [] else . end)
+         end
+       ' "$file" > "$tmp"; then
+      mv "$tmp" "$file"
+    else
+      rm -f "$tmp"
+    fi
+  ) 200>"$lock"
 }
 
 # Print any new room messages for $1 (session_id) and advance their room_cursor.
@@ -104,12 +152,19 @@ room_deliver_new() {
   cursor=$(jq -r --arg sid "$sid" '.sessions[] | select(.session_id == $sid) | .room_cursor // 0' "$LOBBY_FILE")
   total=$(wc -l < "$f")
   if [[ "$total" -gt "$cursor" ]]; then
+    # Render undelivered lines, skipping this session's own messages. `say`
+    # deliberately does NOT advance the cursor (doing so could skip over a
+    # concurrent message from the other member); own lines pass through here
+    # and are filtered out at render time instead.
     local rendered
-    rendered=$(tail -n +"$((cursor + 1))" "$f" | jq -r '
-      if .system == true then "  [system] " + .text
-      else "  " + .from_short + ": " + .text end
+    rendered=$(tail -n +"$((cursor + 1))" "$f" | jq -r --arg sid "$sid" '
+      select((.from_full // "") != $sid)
+      | if .system == true then "  [system] " + .text
+        else "  " + .from_short + ": " + .text end
     ')
-    printf '[ROOM %s] new messages (use `~/.claude/hooks/lobby/room.sh say --session %s --text "..."` to reply, or `room.sh leave --session %s` to exit):\n%s' "$room" "$sid" "$sid" "$rendered"
+    if [[ -n "$rendered" ]]; then
+      printf '[ROOM %s] new messages (use `~/.claude/hooks/lobby/room.sh say --session %s --text "..."` to reply, or `room.sh leave --session %s` to exit):\n%s' "$room" "$sid" "$sid" "$rendered"
+    fi
     lobby_write '
       .sessions |= map(if .session_id == $sid then .room_cursor = ($n | tonumber) else . end)
     ' --arg sid "$sid" --argjson n "$total"

@@ -67,7 +67,7 @@ case "$cmd" in
     set_files_b=$([[ $has_files -eq 1 ]] && echo true || echo false)
 
     (
-      flock 200
+      flock -w 5 200 || { echo "note.sh set: lobby lock busy, try again" >&2; exit 1; }
       lobby_prune
       lobby_write '
         if (.sessions | map(.session_id) | index($sid))
@@ -112,7 +112,7 @@ case "$cmd" in
       exit 2
     fi
     (
-      flock 200
+      flock -w 5 200 || { echo "note.sh clear: lobby lock busy, try again" >&2; exit 1; }
       lobby_write '
         .sessions |= map(
           if .session_id == $sid
@@ -128,7 +128,7 @@ case "$cmd" in
 
   show)
     (
-      flock 200
+      flock -w 5 200 || { echo "note.sh show: lobby lock busy, try again" >&2; exit 1; }
       lobby_prune
       jq -r '
         .sessions[] |

@@ -7,7 +7,9 @@ same files, and can ask each other questions or hold a side conversation.
 Everything is plain Bash + [`jq`](https://jqlang.github.io/jq/) + `flock`. There is no
 daemon and no network: sessions communicate through a single JSON file
 (`<repo>/.claude/lobby.json`) and append-only room transcripts under
-`<repo>/.claude/rooms/`, all guarded by a file lock.
+`<repo>/.claude/rooms/`, all guarded by a file lock. Lock acquisitions time out after
+5 seconds and fail open — coordination is advisory, so a wedged lock degrades to "no
+coordination this turn" rather than stalling every hook and tool call.
 
 ## What it does
 
@@ -31,7 +33,7 @@ These scripts are registered as Claude Code hooks in `~/.claude/settings.json`:
 
 | Hook event        | Matcher                            | Script                | Role |
 |-------------------|------------------------------------|-----------------------|------|
-| `SessionStart`    | —                                  | `lobby/register.sh`   | Add this session to the lobby. |
+| `SessionStart`    | —                                  | `lobby/register.sh`   | Add this session to the lobby (on `compact`/`resume` the existing entry is preserved, heartbeat only). |
 | `UserPromptSubmit`| —                                  | `lobby/inject.sh`     | Heartbeat, clear per-turn claims, inject inbox + other sessions' notes/claims + new room messages. |
 | `PreToolUse`      | `Edit\|Write\|MultiEdit\|NotebookEdit` | `lobby/claim.sh`  | Claim the target file or deny if another session holds it. |
 | `PostToolUse`     | `Edit\|Write\|MultiEdit\|NotebookEdit` | `lobby/post-edit-inbox.sh` | Deliver newly-arrived inbox / room messages mid-turn. |
@@ -64,6 +66,7 @@ repo root (so sessions launched at different depths in the same repo share state
       "last_seen": "…",
       "last_seen_epoch": 1748…,         // used for stale-pruning
       "claims": ["/abs/path/a.ts"],     // files held THIS turn; cleared on Stop
+      "anchors": ["/other/repo"],       // foreign repo roots this session claimed files in
       "note": "refactoring auth",       // optional intent
       "plan_path": "…",                 // optional
       "planned_files": ["/abs/…"],      // optional
@@ -83,8 +86,11 @@ repo root (so sessions launched at different depths in the same repo share state
   object per line), with its own `.lock`.
 
 Claims are **per-turn** (cleared on `Stop` and at the next `UserPromptSubmit`), representing
-"actively editing right now". Notes/inbox/room membership are **per-session** and persist
-until `SessionEnd` or stale-prune (default 30 min idle, `LOBBY_STALE_AFTER_SEC`).
+"actively editing right now". A claim on a file in a *different* git repo than the session's
+home anchor is recorded in that repo's lobby; the foreign repo root is tracked in `anchors`
+on the home entry so `Stop`/`SessionEnd` release those claims too. Notes/inbox/room
+membership are **per-session** and persist until `SessionEnd` or stale-prune (default 30 min
+idle, `LOBBY_STALE_AFTER_SEC`).
 
 ## Usage (from inside a session)
 
@@ -100,7 +106,8 @@ The agent's own short id is shown in injected context as `You are session <short
 # Ask another session a question (or broadcast with `all`)
 /btw <other_short_id> Will you modify parseToken() in auth.ts?
 
-# Acknowledge / clear your inbox after handling messages
+# Acknowledge / clear your inbox after handling messages (only messages already
+# shown to you are removed; ones that arrived since stay queued)
 ~/.claude/hooks/lobby/btw.sh ack --session <sid>
 
 # Open a private room for sustained discussion
@@ -144,7 +151,8 @@ Inspect state manually:
   and time-based. A crashed session lingers until another session triggers a prune; a session
   idle for >30 min is pruned even if still alive, dropping its claims/notes/room membership.
 - **Best-effort cleanup.** `SessionEnd`/`Stop` may not fire on a hard crash or `kill -9`,
-  leaving orphaned claims, inbox entries, or room files until stale-prune.
+  leaving orphaned claims and inbox entries until stale-prune (which also garbage-collects
+  room transcripts left with no members).
 - **`flock`/POSIX-only.** Relies on `flock` and same-host filesystem semantics; it will not
   coordinate across machines or over a network share without working `flock`. Untested on
   macOS/BSD (`flock`, `date -Iseconds`, `od` flags differ).

@@ -27,7 +27,8 @@ now=$(date +%s)
 
 context=$(
   (
-    flock 200
+    # Fail open on lock contention: skip delivery rather than stall the edit.
+    flock -w 5 200 || exit 0
     lobby_prune
 
     # Pull undelivered messages for this session, render them, then mark delivered.

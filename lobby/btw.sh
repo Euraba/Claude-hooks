@@ -2,7 +2,9 @@
 # Side-channel messaging between Claude sessions in the same project.
 # Messages live in each session's `inbox` array in lobby.json. Senders write
 # into the recipient's inbox; inject.sh surfaces a session's own inbox to it
-# on UserPromptSubmit. Recipients run `btw.sh ack` to clear after handling.
+# on UserPromptSubmit. Recipients run `btw.sh ack` after handling; ack only
+# removes messages that were already delivered, so anything that arrived
+# since the last injection stays queued.
 #
 # Usage:
 #   btw.sh send  --from <sid_or_short> --to <sid_or_short_or_all> --text "..."
@@ -31,20 +33,8 @@ done
 
 lobby_init
 
-# Resolve a short or full id to a full session_id present in lobby.json.
-# Empty result => not found.
-resolve_sid() {
-  local needle="$1"
-  jq -r --arg n "$needle" '
-    .sessions
-    | map(.session_id)
-    | map(select(. == $n or startswith($n)))
-    | if length == 1 then .[0] else "" end
-  ' "$LOBBY_FILE"
-}
-
-# Resolve a short or full id, allow self-resolution via prefix even if
-# multiple matches exist (pick exact match first).
+# Resolve a short or full id to a full session_id present in lobby.json,
+# preferring an exact match, then a unique prefix. Empty result => not found.
 resolve_sid_strict() {
   local needle="$1"
   jq -r --arg n "$needle" '
@@ -67,7 +57,6 @@ case "$cmd" in
     [[ -z "$from_full" ]] && { echo "btw.sh send: --from '$from' did not match any session" >&2; exit 2; }
     from_short="${from_full:0:8}"
     now_iso=$(date -Iseconds)
-    now=$(date +%s)
 
     if [[ "$to" == "all" ]]; then
       targets_json=$(jq --arg from "$from_full" '[.sessions[] | select(.session_id != $from) | .session_id]' "$LOBBY_FILE")
@@ -83,8 +72,11 @@ case "$cmd" in
     fi
 
     (
-      flock 200
+      flock -w 5 200 || { echo "btw.sh send: lobby lock busy, try again" >&2; exit 1; }
       lobby_prune
+      # Only the inbox is touched: a message must NOT refresh the recipient's
+      # heartbeat, or a dead session that keeps receiving mail never goes
+      # stale and its leftover claims linger forever.
       lobby_write '
         .sessions |= map(
           if (.session_id as $sid | $targets | index($sid))
@@ -95,8 +87,6 @@ case "$cmd" in
                  sent_at:      $now_iso,
                  delivered_at: null
                }])
-               | .last_seen = $now_iso
-               | .last_seen_epoch = ($now | tonumber)
           else . end
         )
       ' \
@@ -104,8 +94,7 @@ case "$cmd" in
         --arg from_short "$from_short" \
         --arg from_full  "$from_full" \
         --arg text       "$text" \
-        --arg now_iso    "$now_iso" \
-        --argjson now    "$now"
+        --arg now_iso    "$now_iso"
     ) 200>"$LOBBY_LOCK"
     ;;
 
@@ -114,7 +103,7 @@ case "$cmd" in
     sid_full=$(resolve_sid_strict "$session_id")
     [[ -z "$sid_full" ]] && { echo "btw.sh inbox: --session '$session_id' did not match" >&2; exit 2; }
     (
-      flock 200
+      flock -w 5 200 || { echo "btw.sh inbox: lobby lock busy, try again" >&2; exit 1; }
       lobby_prune
       jq -r --arg sid "$sid_full" '
         .sessions[] | select(.session_id == $sid) | .inbox // [] |
@@ -130,10 +119,15 @@ case "$cmd" in
     sid_full=$(resolve_sid_strict "$session_id")
     [[ -z "$sid_full" ]] && { echo "btw.sh ack: --session '$session_id' did not match" >&2; exit 2; }
     (
-      flock 200
+      flock -w 5 200 || { echo "btw.sh ack: lobby lock busy, try again" >&2; exit 1; }
+      # Only drop messages that were already delivered (shown to the agent).
+      # Anything that arrived after the last injection has not been seen yet
+      # and must survive the ack.
       lobby_write '
         .sessions |= map(
-          if .session_id == $sid then .inbox = [] else . end
+          if .session_id == $sid
+          then .inbox = ((.inbox // []) | map(select((.delivered_at // null) == null)))
+          else . end
         )
       ' --arg sid "$sid_full"
     ) 200>"$LOBBY_LOCK"
@@ -141,7 +135,7 @@ case "$cmd" in
 
   show)
     (
-      flock 200
+      flock -w 5 200 || { echo "btw.sh show: lobby lock busy, try again" >&2; exit 1; }
       lobby_prune
       jq -r '
         .sessions[] |

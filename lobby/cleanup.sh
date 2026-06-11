@@ -11,21 +11,32 @@ session_id=$(jq -r '.session_id // empty' <<<"$input")
 
 ROOMS_DIR="$LOBBY_DIR/rooms"
 
-(
-  flock 200
-  # Snapshot the leaving session's room id (if any) before removing the entry.
-  leaving_room=$(jq -r --arg sid "$session_id" '
-    .sessions[] | select(.session_id == $sid) | .room_id // ""
-  ' "$LOBBY_FILE")
+anchors=$(
+  (
+    flock -w 5 200 || exit 0
+    # Snapshot the leaving session's room id and foreign anchors before
+    # removing the entry. Anchors are printed for the release loop below.
+    leaving_room=$(jq -r --arg sid "$session_id" '
+      .sessions[] | select(.session_id == $sid) | .room_id // ""
+    ' "$LOBBY_FILE")
+    jq -r --arg sid "$session_id" '
+      (.sessions[]? | select(.session_id == $sid) | .anchors // []) | .[]
+    ' "$LOBBY_FILE"
 
-  lobby_write '.sessions |= map(select(.session_id != $sid))' --arg sid "$session_id"
+    lobby_write '.sessions |= map(select(.session_id != $sid))' --arg sid "$session_id"
 
-  if [[ -n "$leaving_room" ]]; then
-    members=$(jq -r --arg room "$leaving_room" '[.sessions[] | select(.room_id == $room)] | length' "$LOBBY_FILE")
-    if [[ "$members" -eq 0 ]]; then
-      rm -f "$ROOMS_DIR/$leaving_room.jsonl" "$ROOMS_DIR/$leaving_room.jsonl.lock"
+    if [[ -n "$leaving_room" ]]; then
+      members=$(jq -r --arg room "$leaving_room" '[.sessions[] | select(.room_id == $room)] | length' "$LOBBY_FILE")
+      if [[ "$members" -eq 0 ]]; then
+        rm -f "$ROOMS_DIR/$leaving_room.jsonl" "$ROOMS_DIR/$leaving_room.jsonl.lock"
+      fi
     fi
-  fi
-) 200>"$LOBBY_LOCK"
+  ) 200>"$LOBBY_LOCK"
+)
+
+# Remove this session from any foreign-repo lobbies it claimed files in.
+while IFS= read -r anchor; do
+  [[ -n "$anchor" ]] && lobby_release_anchor "$session_id" "$anchor" remove
+done <<<"$anchors"
 
 exit 0
