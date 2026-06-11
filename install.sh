@@ -53,7 +53,7 @@ jq --arg lobby "$LOBBY" '
   | .hooks.SessionStart     = ((.hooks.SessionStart     | drop_lobby) + [entry("register.sh")])
   | .hooks.UserPromptSubmit = ((.hooks.UserPromptSubmit | drop_lobby) + [entry("inject.sh")])
   | .hooks.PreToolUse       = ((.hooks.PreToolUse       | drop_lobby) + [entry("claim.sh"; "Edit|Write|MultiEdit|NotebookEdit")])
-  | .hooks.PostToolUse      = ((.hooks.PostToolUse      | drop_lobby) + [entry("post-edit-inbox.sh"; "Edit|Write|MultiEdit|NotebookEdit")])
+  | .hooks.PostToolUse      = ((.hooks.PostToolUse      | drop_lobby) + [entry("post-edit-inbox.sh")])
   | .hooks.Stop             = ((.hooks.Stop             | drop_lobby) + [entry("release.sh")])
   | .hooks.SessionEnd       = ((.hooks.SessionEnd       | drop_lobby) + [entry("cleanup.sh")])
 ' "$SETTINGS" > "$tmp"

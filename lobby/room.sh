@@ -5,8 +5,8 @@
 # Membership is recorded as `room_id` on each session entry in lobby.json
 # (plus `room_cursor`, the count of lines already delivered to that session).
 # Delivery happens via inject.sh (UserPromptSubmit) and post-edit-inbox.sh
-# (PostToolUse on Edit/Write/MultiEdit/NotebookEdit) so each side sees the
-# other's new lines after their next edit or next user prompt.
+# (PostToolUse on all tools) so each side sees the other's new lines after
+# their next tool call or next user prompt.
 #
 # Usage:
 #   room.sh invite --from <sid> --to <sid> [--topic <text>]

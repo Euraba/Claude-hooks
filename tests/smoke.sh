@@ -24,10 +24,13 @@ echo "{\"session_id\":\"$SB\",\"source\":\"startup\"}" | "$H/register.sh"
 check "both sessions registered" jq -e '.sessions | length == 2' "$A_LOBBY"
 
 echo "=== claims: same-repo deny ==="
+"$H/note.sh" set --session "$SA" --note "refactoring foo module"
 out=$(echo "{\"session_id\":\"$SA\",\"tool_input\":{\"file_path\":\"$T/repoA/foo.ts\"}}" | "$H/claim.sh")
 check "SA claim foo.ts allowed (no output)" test -z "$out"
 out=$(echo "{\"session_id\":\"$SB\",\"tool_input\":{\"file_path\":\"$T/repoA/foo.ts\"}}" | "$H/claim.sh")
 check "SB claim foo.ts denied" grep -q '"permissionDecision":"deny"' <<<"$out"
+check "deny reason includes holder's note" grep -q "refactoring foo module" <<<"$out"
+"$H/note.sh" clear --session "$SA"
 
 echo "=== bug 1: cross-repo claim + release ==="
 out=$(echo "{\"session_id\":\"$SA\",\"tool_input\":{\"file_path\":\"$T/repoB/bar.ts\"}}" | "$H/claim.sh")

@@ -61,15 +61,16 @@ lobby_init
 now=$(date +%s)
 now_iso=$(date -Iseconds)
 
-other_sid=$(
+other_claim=$(
   (
     # Fail open on lock contention: no claim check beats stalling every edit.
     flock -w 5 200 || exit 0
     lobby_prune
-    # Is the path claimed by any OTHER live session?
+    # Is the path claimed by any OTHER live session? Return "<sid>\t<note>"
+    # so the deny reason can include the holder's posted intent.
     other=$(jq -r --arg sid "$session_id" --arg path "$abs_path" '
       [.sessions[] | select(.session_id != $sid and ((.claims // []) | index($path)))]
-      | if length > 0 then .[0].session_id else "" end
+      | if length > 0 then (.[0].session_id + "\t" + (.[0].note // "")) else "" end
     ' "$LOBBY_FILE")
     if [[ -n "$other" ]]; then
       printf '%s' "$other"
@@ -100,8 +101,12 @@ other_sid=$(
   ) 200>"$LOBBY_LOCK"
 )
 
-if [[ -n "$other_sid" ]]; then
-  reason="$abs_path is currently claimed by another Claude session (${other_sid:0:8}) in this project. Either wait for that session to release it, ask it directly with /btw ${other_sid:0:8} \"<your question>\" (e.g. 'will you modify <method>?'), or ask the user to coordinate."
+if [[ -n "$other_claim" ]]; then
+  other_sid="${other_claim%%$'\t'*}"
+  other_note="${other_claim#*$'\t'}"
+  note_part=""
+  [[ -n "$other_note" ]] && note_part=" That session's posted intent: \"$other_note\"."
+  reason="$abs_path is currently claimed by another Claude session (${other_sid:0:8}) in this project.${note_part} Either wait for that session to release it, ask it directly with /btw ${other_sid:0:8} \"<your question>\" (e.g. 'will you modify <method>?'), or ask the user to coordinate."
   jq -nc --arg reason "$reason" '{
     hookSpecificOutput: {
       hookEventName: "PreToolUse",

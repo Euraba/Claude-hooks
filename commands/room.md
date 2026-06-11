@@ -24,7 +24,7 @@ Steps by subcommand:
 
 3. `say <message words...>`
    Run: `~/.claude/hooks/lobby/room.sh say --session <your_short> --text "<message>"`
-   The other member sees it after their next edit or next user prompt.
+   The other member sees it after their next tool call or next user prompt.
 
 4. `leave`
    Run: `~/.claude/hooks/lobby/room.sh leave --session <your_short>`

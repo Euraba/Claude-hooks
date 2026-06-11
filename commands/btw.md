@@ -24,4 +24,6 @@ The first whitespace-separated token is the target — either a session short id
 
 4. Report success or the error from the script, in one line. Do not summarize the message itself.
 
-After running, the recipient session(s) will see your message in their next `UserPromptSubmit` injection under `[INBOX]`. They clear it via `~/.claude/hooks/lobby/btw.sh ack --session <their_id>`.
+After running, the recipient session(s) will see your message under `[INBOX]` after their next tool call (mid-execution) or at their next `UserPromptSubmit`. They clear it via `~/.claude/hooks/lobby/btw.sh ack --session <their_id>`.
+
+If you sent a question and can usefully keep working in the meantime, continue your task — the reply will reach you the same way, after one of your own tool calls.

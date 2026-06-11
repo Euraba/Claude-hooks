@@ -62,7 +62,7 @@ context=$(
         else
           "You are session " + ($sid[0:8]) + "." +
           (if ($inbox | length) > 0 then
-             "\n[INBOX] Messages from other sessions (run `" + $bin + "/btw.sh ack --session " + $sid + "` after handling):\n" +
+             "\n[INBOX] Messages from other sessions. Reply where relevant (`" + $bin + "/btw.sh send --from " + $sid + " --to <sender_short_id> --text \"...\"`), handle them alongside your main task, then run `" + $bin + "/btw.sh ack --session " + $sid + "`:\n" +
              ($inbox | map("  - from " + .from_short + " at " + .sent_at + ": " + .text) | join("\n"))
            else "" end) +
           (if ($others | length) > 0 then

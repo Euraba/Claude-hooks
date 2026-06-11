@@ -25,7 +25,9 @@ coordination this turn" rather than stalling every hook and tool call.
   between two (or more) sessions.
 
 All cross-session text reaches an agent by being **injected into its context** — at the
-start of each turn (`UserPromptSubmit`) and after every file edit (`PostToolUse`).
+start of each turn (`UserPromptSubmit`) and after every tool call (`PostToolUse`), so
+questions reach a working session mid-execution and a conversation can progress without
+either side ending its turn.
 
 ## Install
 
@@ -54,7 +56,7 @@ Then copy the [agent protocol block](#teach-your-agents-the-protocol) into your
 | `SessionStart`    | —                                  | `lobby/register.sh`   | Add this session to the lobby (on `compact`/`resume` the existing entry is preserved, heartbeat only). |
 | `UserPromptSubmit`| —                                  | `lobby/inject.sh`     | Heartbeat, clear per-turn claims, inject inbox + other sessions' notes/claims + new room messages. |
 | `PreToolUse`      | `Edit\|Write\|MultiEdit\|NotebookEdit` | `lobby/claim.sh`  | Claim the target file or deny if another session holds it. |
-| `PostToolUse`     | `Edit\|Write\|MultiEdit\|NotebookEdit` | `lobby/post-edit-inbox.sh` | Deliver newly-arrived inbox / room messages mid-turn. |
+| `PostToolUse`     | — (all tools)                      | `lobby/post-edit-inbox.sh` | Deliver newly-arrived inbox / room messages mid-execution, after any tool call. |
 | `Stop`            | —                                  | `lobby/release.sh`    | End of turn: release this session's file claims. |
 | `SessionEnd`      | —                                  | `lobby/cleanup.sh`    | Remove the session; delete rooms with no members left. |
 
@@ -184,10 +186,13 @@ If a file Edit/Write is denied because another session has claimed the file (the
     /btw <other_short_id> Will you modify <method/symbol> in <file>? I need to <reason>.
 
 - Targets a single session by short id, or `all` to broadcast.
-- The recipient sees your message in their next `UserPromptSubmit` injection under
-  `[INBOX]`.
-- When you receive a message under `[INBOX]`, respond promptly (with
-  `/btw <sender_short_id> ...`) and then clear your inbox using the exact ack
+- The recipient sees your message under `[INBOX]` after their next tool call
+  (mid-execution) or at their next `UserPromptSubmit`. If you can usefully keep
+  working while you wait, do — the reply reaches you the same way, after one of
+  your own tool calls.
+- When you receive a message under `[INBOX]`, answer briefly right away (with
+  `/btw <sender_short_id> ...`) and then CONTINUE your current task — replying
+  does not require stopping your work. Clear your inbox using the exact ack
   command shown in the injection.
 - Inspect any session's inbox manually: `~/.claude/hooks/lobby/btw.sh show`.
 
@@ -195,7 +200,7 @@ If a file Edit/Write is denied because another session has claimed the file (the
 
 For sustained back-and-forth (more than one or two `/btw` exchanges), open a
 private room. Each room is a shared append-only transcript; only members see it.
-Delivery is the same as inbox: at `UserPromptSubmit` and after every Edit/Write.
+Delivery is the same as inbox: at `UserPromptSubmit` and after every tool call.
 
 - `/room invite <other_short_id> [topic]` (creates the room, sends an inbox invite)
 - Recipient: `/room accept <room_id>` (room id is in the `[ROOM INVITE]` message)
@@ -228,9 +233,9 @@ Debugging: set `LOBBY_DEBUG_LOG=/some/path` to log every hook invocation (off by
 - **Claims are coarse, file-level, and per-turn.** Two agents editing *different functions in
   the same file* can't both proceed: the second is denied outright. Conversely, a claim is
   released at `Stop`, so a long multi-turn edit on one file is unprotected between turns.
-- **Delivery is poll-based, not push.** Messages only surface at the next `UserPromptSubmit`
-  or after the recipient's next file edit. A session that is idle, only reading, or waiting on
-  the user will not see an inbox/room message until it acts again.
+- **Delivery is poll-based, not push.** Messages surface after the recipient's next tool call
+  or at its next `UserPromptSubmit`. A session that is idle (waiting on the user, not running
+  tools) will not see an inbox/room message until it acts again.
 - **Short-id (8-char prefix) collisions are unhandled.** `resolve_sid` returns empty on an
   ambiguous prefix, so commands silently fail to target rather than erroring helpfully. UUID
   prefixes make this unlikely but not impossible.
@@ -262,6 +267,8 @@ Debugging: set `LOBBY_DEBUG_LOG=/some/path` to log every hook invocation (off by
   turn can't hold a file indefinitely.
 - **Better ambiguity handling** — when a short-id prefix is ambiguous, list the candidates and
   return a clear error instead of silently no-op'ing.
+- **Synchronous ask** — `btw.sh ask --wait <sec>`: post a question and block (with timeout)
+  until the target answers, for the "denied a file and cannot proceed without an answer" case.
 - **Schema versioning + migration** — add a `version` field and migrate (rather than reset) on
   format changes; back up before any destructive reinit.
 - **Inbox/room hygiene** — cap inbox size, auto-expire delivered+acked messages, and

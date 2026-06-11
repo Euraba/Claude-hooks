@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# PostToolUse hook for Edit|Write|MultiEdit|NotebookEdit:
-# After each file edit, deliver any inbox messages that haven't been shown
-# to this session yet. Marks them `delivered_at = now` so they aren't
-# re-injected on every subsequent edit. Messages remain in the inbox until
-# the session runs `btw.sh ack` (so they also show again at the next
-# UserPromptSubmit, which serves as a turn-boundary reminder).
+# PostToolUse hook (all tools):
+# After each tool call, deliver any inbox messages that haven't been shown
+# to this session yet — so questions from other sessions reach an agent
+# mid-execution instead of waiting for its next file edit or user prompt.
+# Marks them `delivered_at = now` so they aren't re-injected on every
+# subsequent tool call. Messages remain in the inbox until the session runs
+# `btw.sh ack` (so they also show again at the next UserPromptSubmit, which
+# serves as a turn-boundary reminder).
 . "$(dirname "$0")/lib.sh"
 
 if [[ -z "${CLAUDE_PROJECT_DIR:-}" ]]; then
@@ -37,7 +39,7 @@ context=$(
       | map(select((.delivered_at // null) == null))
       | if length == 0 then ""
         else
-          "[INBOX] New messages arrived from other Claude sessions while you were working. Address them or run `" + $bin + "/btw.sh ack --session " + $sid + "` after handling:\n" +
+          "[INBOX] New messages from other Claude sessions arrived while you were working. Reply briefly now (`" + $bin + "/btw.sh send --from " + $sid + " --to <sender_short_id> --text \"...\"`), then CONTINUE your current task — answering does not require abandoning your work. Run `" + $bin + "/btw.sh ack --session " + $sid + "` once handled:\n" +
           (map("  - from " + .from_short + " at " + .sent_at + ": " + .text) | join("\n"))
         end
     ' "$LOBBY_FILE")
