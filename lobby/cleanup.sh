@@ -9,17 +9,18 @@ input=$(cat)
 session_id=$(jq -r '.session_id // empty' <<<"$input")
 [[ -z "$session_id" ]] && exit 0
 
-ROOMS_DIR="$LOBBY_DIR/rooms"
 now_iso=$(date -Iseconds)
 
 anchors=$(
   (
     flock -w 5 200 || exit 0
-    # Snapshot the leaving session's room id and foreign anchors before
-    # removing the entry. Anchors are printed for the release loop below.
+    # Snapshot the leaving session's room id / role links and foreign anchors
+    # before removing the entry. Anchors are printed for the release loop below.
     leaving_room=$(jq -r --arg sid "$session_id" '
       .sessions[] | select(.session_id == $sid) | .room_id // ""
     ' "$LOBBY_FILE")
+    leaving_role=$(session_field "$session_id" '.role')
+    leaving_main=$(session_field "$session_id" '.main_sid')
     jq -r --arg sid "$session_id" '
       (.sessions[]? | select(.session_id == $sid) | .anchors // []) | .[]
     ' "$LOBBY_FILE"
@@ -30,6 +31,16 @@ anchors=$(
       | notify_waiters($freed; "(its holder session ended)"; $ts)
       | .waiters = ((.waiters // []) | map(select(.sid != $sid)))
     ' --arg sid "$session_id" --arg ts "$now_iso"
+
+    if [[ "$leaving_role" == "main" && -n "$leaving_room" ]]; then
+      # Waiting reviewers see this on their next wait cycle; their MAIN_GONE
+      # check then releases them.
+      append_room_line "$leaving_room" "$(jq -nc --arg ts "$now_iso" --arg s "${session_id:0:8}" \
+        '{system: true, text: ("main " + $s + " ended"), ts: $ts}')"
+    elif [[ "$leaving_role" == "reviewer" && -n "$leaving_main" ]]; then
+      # If the departing reviewer held the review turn, advance/finalize past it.
+      review_self_heal "$leaving_main"
+    fi
 
     if [[ -n "$leaving_room" ]]; then
       members=$(jq -r --arg room "$leaving_room" '[.sessions[] | select(.room_id == $room)] | length' "$LOBBY_FILE")

@@ -16,6 +16,7 @@ fi
 
 input=$(cat)
 session_id=$(jq -r '.session_id // empty' <<<"$input")
+transcript_path=$(jq -r '.transcript_path // empty' <<<"$input")
 if [[ -z "$session_id" ]]; then
   echo '{}'
   exit 0
@@ -26,6 +27,22 @@ fi
 
 now_iso=$(date -Iseconds)
 now=$(date +%s)
+
+# Advisory context warning for mains nearing the handoff threshold. The
+# authoritative succession trigger stays in stop-gate.sh (single trigger
+# point — no double-handoff races). Computed BEFORE taking the lobby lock:
+# the transcript scan doesn't need it, and lobby.json reads are atomic.
+ctx_warn=""
+role=$(jq -r --arg sid "$session_id" '.sessions[] | select(.session_id == $sid) | .role // empty' "$LOBBY_FILE" 2>/dev/null)
+if [[ "$role" == "main" ]]; then
+  handoff_status=$(jq -r --arg sid "$session_id" '.sessions[] | select(.session_id == $sid) | .handoff.status // empty' "$LOBBY_FILE" 2>/dev/null)
+  if [[ -z "$handoff_status" ]]; then
+    pct=$(estimate_ctx_pct "$transcript_path")
+    if [[ -n "$pct" && "$pct" -ge "${LOBBY_HANDOFF_PCT:-50}" ]]; then
+      ctx_warn="[CONTEXT] You are at ~${pct}% context. Wrap up the current edit cleanly — a handoff to your reviewer will trigger the next time you stop."
+    fi
+  fi
+fi
 
 context=$(
   (
@@ -60,13 +77,13 @@ context=$(
       ' --arg sid "$session_id" --arg now_iso "$now_iso" --argjson now "$now"
     fi
     room_new=$(room_deliver_new "$session_id")
-    if [[ -n "$undelivered" && -n "$room_new" ]]; then
-      printf '%s\n%s' "$undelivered" "$room_new"
-    elif [[ -n "$undelivered" ]]; then
-      printf '%s' "$undelivered"
-    else
-      printf '%s' "$room_new"
-    fi
+    out=""
+    for part in "$undelivered" "$room_new" "$ctx_warn"; do
+      [[ -z "$part" ]] && continue
+      if [[ -z "$out" ]]; then out="$part"; else out="$out
+$part"; fi
+    done
+    printf '%s' "$out"
   ) 200>"$LOBBY_LOCK"
 )
 

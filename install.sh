@@ -54,13 +54,13 @@ jq --arg lobby "$LOBBY" '
   | .hooks.UserPromptSubmit = ((.hooks.UserPromptSubmit | drop_lobby) + [entry("inject.sh")])
   | .hooks.PreToolUse       = ((.hooks.PreToolUse       | drop_lobby) + [entry("claim.sh"; "Edit|Write|MultiEdit|NotebookEdit")])
   | .hooks.PostToolUse      = ((.hooks.PostToolUse      | drop_lobby) + [entry("post-edit-inbox.sh")])
-  | .hooks.Stop             = ((.hooks.Stop             | drop_lobby) + [entry("release.sh")])
+  | .hooks.Stop             = ((.hooks.Stop             | drop_lobby) + [entry("stop-gate.sh")])
   | .hooks.SessionEnd       = ((.hooks.SessionEnd       | drop_lobby) + [entry("cleanup.sh")])
 ' "$SETTINGS" > "$tmp"
 mv "$tmp" "$SETTINGS"
 
 # --- slash commands -----------------------------------------------------------
-for cmd in btw room; do
+for cmd in btw room mission review-request review-status handoff; do
   sed "s|~/.claude/hooks/lobby|$LOBBY|g" "$REPO_DIR/commands/$cmd.md" > "$COMMANDS_DIR/$cmd.md"
 done
 

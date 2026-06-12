@@ -33,27 +33,14 @@ done
 
 lobby_init
 
-# Resolve a short or full id to a full session_id present in lobby.json,
-# preferring an exact match, then a unique prefix. Empty result => not found.
-resolve_sid_strict() {
-  local needle="$1"
-  jq -r --arg n "$needle" '
-    .sessions | map(.session_id) as $ids
-    | ($ids | map(select(. == $n))) as $exact
-    | if ($exact | length) == 1 then $exact[0]
-      else
-        ($ids | map(select(startswith($n)))) as $pref
-        | if ($pref | length) == 1 then $pref[0] else "" end
-      end
-  ' "$LOBBY_FILE"
-}
+# resolve_sid comes from lib.sh (exact match first, then unique prefix).
 
 case "$cmd" in
   send)
     [[ -z "$from" || -z "$to" || -z "$text" ]] && {
       echo "btw.sh send: need --from, --to, --text" >&2; exit 2; }
 
-    from_full=$(resolve_sid_strict "$from")
+    from_full=$(resolve_sid "$from")
     [[ -z "$from_full" ]] && { echo "btw.sh send: --from '$from' did not match any session" >&2; exit 2; }
     from_short="${from_full:0:8}"
     now_iso=$(date -Iseconds)
@@ -61,7 +48,7 @@ case "$cmd" in
     if [[ "$to" == "all" ]]; then
       targets_json=$(jq --arg from "$from_full" '[.sessions[] | select(.session_id != $from) | .session_id]' "$LOBBY_FILE")
     else
-      to_full=$(resolve_sid_strict "$to")
+      to_full=$(resolve_sid "$to")
       [[ -z "$to_full" ]] && { echo "btw.sh send: --to '$to' did not match any session" >&2; exit 2; }
       [[ "$to_full" == "$from_full" ]] && { echo "btw.sh send: cannot send to self" >&2; exit 2; }
       targets_json=$(jq -n --arg t "$to_full" '[$t]')
@@ -100,7 +87,7 @@ case "$cmd" in
 
   inbox)
     [[ -z "$session_id" ]] && { echo "btw.sh inbox: missing --session" >&2; exit 2; }
-    sid_full=$(resolve_sid_strict "$session_id")
+    sid_full=$(resolve_sid "$session_id")
     [[ -z "$sid_full" ]] && { echo "btw.sh inbox: --session '$session_id' did not match" >&2; exit 2; }
     (
       flock -w 5 200 || { echo "btw.sh inbox: lobby lock busy, try again" >&2; exit 1; }
@@ -116,7 +103,7 @@ case "$cmd" in
 
   ack)
     [[ -z "$session_id" ]] && { echo "btw.sh ack: missing --session" >&2; exit 2; }
-    sid_full=$(resolve_sid_strict "$session_id")
+    sid_full=$(resolve_sid "$session_id")
     [[ -z "$sid_full" ]] && { echo "btw.sh ack: --session '$session_id' did not match" >&2; exit 2; }
     (
       flock -w 5 200 || { echo "btw.sh ack: lobby lock busy, try again" >&2; exit 1; }

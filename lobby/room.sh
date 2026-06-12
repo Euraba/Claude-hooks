@@ -18,7 +18,6 @@
 #   room.sh list
 . "$(dirname "$0")/lib.sh"
 
-ROOMS_DIR="$LOBBY_DIR/rooms"
 INBOX_TOOL="$(dirname "$0")/btw.sh"
 
 cmd="${1:-}"
@@ -40,32 +39,12 @@ done
 lobby_init
 mkdir -p "$ROOMS_DIR"
 
-resolve_sid() {
-  local needle="$1"
-  jq -r --arg n "$needle" '
-    .sessions | map(.session_id) as $ids
-    | ($ids | map(select(. == $n))) as $exact
-    | if ($exact | length) == 1 then $exact[0]
-      else
-        ($ids | map(select(startswith($n)))) as $pref
-        | if ($pref | length) == 1 then $pref[0] else "" end
-      end
-  ' "$LOBBY_FILE"
-}
+# resolve_sid and append_room_line come from lib.sh.
 
 session_room() {
   jq -r --arg sid "$1" '
     .sessions[] | select(.session_id == $sid) | .room_id // ""
   ' "$LOBBY_FILE"
-}
-
-append_room_line() {
-  local room="$1"; local payload="$2"
-  local f="$ROOMS_DIR/$room.jsonl"
-  (
-    flock -w 5 201 || exit 1
-    printf '%s\n' "$payload" >> "$f"
-  ) 201>"$f.lock"
 }
 
 case "$cmd" in

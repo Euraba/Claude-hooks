@@ -87,13 +87,44 @@ context=$(
         end
     ' "$LOBBY_FILE"
     )
-    if [[ -n "$room_text" && -n "$main_text" ]]; then
-      printf '%s\n%s' "$main_text" "$room_text"
-    elif [[ -n "$room_text" ]]; then
-      printf 'You are session %s.\n%s' "${session_id:0:8}" "$room_text"
-    else
-      printf '%s' "$main_text"
+    # Role banner: keeps a roled session oriented even when a human prompts it
+    # mid-loop (and is the only injection when nothing else is pending).
+    role_text=""
+    role=$(jq -r --arg sid "$session_id" '.sessions[] | select(.session_id == $sid) | .role // empty' "$LOBBY_FILE")
+    if [[ "$role" == "main" ]]; then
+      reviewers=$(jq -r --arg sid "$session_id" '
+        [.sessions[] | select(.role == "reviewer" and .main_sid == $sid)]
+        | sort_by(.reviewer_no)
+        | map("R" + (.reviewer_no | tostring) + " " + .session_id[0:8])
+        | join(", ")
+      ' "$LOBBY_FILE")
+      rstatus=$(jq -r --arg sid "$session_id" '.sessions[] | select(.session_id == $sid) | .review.status // "idle"' "$LOBBY_FILE")
+      role_text="[ROLE] You are MAIN (reviewers: ${reviewers:-none})."
+      if [[ "$rstatus" == "in_review" ]]; then
+        role_text="$role_text A review round is IN PROGRESS — run $LOBBY_BIN/review-wait.sh --session $session_id and obey it before anything else."
+      elif [[ "$rstatus" == "changes_requested" ]]; then
+        role_text="$role_text Reviewers REQUESTED CHANGES — fix their findings (see $LOBBY_BIN/review.sh status) before anything else."
+      fi
+    elif [[ "$role" == "reviewer" ]]; then
+      role_text=$(jq -r --arg sid "$session_id" --arg bin "$LOBBY_BIN" '
+        .sessions[] | select(.session_id == $sid)
+        | "[ROLE] You are REVIEWER R" + ((.reviewer_no // 0) | tostring) +
+          " of " + ((.main_sid // "?")[0:8]) +
+          ". You never edit files; after handling this prompt, return to your loop: run " + $bin + "/review-wait.sh --session " + .session_id + " and obey it."
+      ' "$LOBBY_FILE")
     fi
+
+    out=""
+    for part in "$role_text" "$main_text" "$room_text"; do
+      [[ -z "$part" ]] && continue
+      if [[ -z "$out" ]]; then out="$part"; else out="$out
+$part"; fi
+    done
+    if [[ -n "$out" && "$out" != *"You are session"* ]]; then
+      out="You are session ${session_id:0:8}.
+$out"
+    fi
+    printf '%s' "$out"
   ) 200>"$LOBBY_LOCK"
 )
 

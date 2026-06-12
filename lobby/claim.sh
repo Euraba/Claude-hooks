@@ -16,6 +16,27 @@ case "$file_path" in
   *)  abs_path="$CLAUDE_PROJECT_DIR/$file_path" ;;
 esac
 
+# Reviewers are read-only: they review and talk, they don't write. Checked
+# against the HOME lobby before any re-anchoring, so a reviewer editing a
+# file in a different repo can't slip past the gate. Self-releases on
+# promotion to main (succession flips .role). Note this covers the edit
+# tools this hook matches; Bash-side writes are restrained by the role
+# briefing, not by code.
+lobby_init
+my_role=$(session_field "$session_id" '.role')
+if [[ "$my_role" == "reviewer" ]]; then
+  my_no=$(session_field "$session_id" '.reviewer_no')
+  reason="You are reviewer R${my_no:-?}: reviewers are read-only and may not edit files. Discuss in the review room ($LOBBY_BIN/room.sh say --session $session_id --text \"...\") or record a verdict ($LOBBY_BIN/review.sh verdict --session $session_id ...). You may edit only after promotion to main."
+  jq -nc --arg reason "$reason" '{
+    hookSpecificOutput: {
+      hookEventName: "PreToolUse",
+      permissionDecision: "deny",
+      permissionDecisionReason: $reason
+    }
+  }'
+  exit 0
+fi
+
 # If the target file lives in a git repo different from our cwd anchor,
 # point this claim at the file's repo. That way two sessions launched from
 # different dirs (e.g. one in the repo, one in a parent) still coordinate
