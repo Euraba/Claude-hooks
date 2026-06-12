@@ -16,6 +16,26 @@ case "$file_path" in
   *)  abs_path="$CLAUDE_PROJECT_DIR/$file_path" ;;
 esac
 
+# Reviewers are read-only: they review and talk, they don't write. The check
+# self-releases on promotion to main (succession flips .role). Unlocked read:
+# worst case a just-promoted heir gets one spurious denial and retries.
+lobby_init
+my_role=$(jq -r --arg sid "$session_id" \
+  '.sessions[] | select(.session_id == $sid) | .role // empty' "$LOBBY_FILE" 2>/dev/null)
+if [[ "$my_role" == "reviewer" ]]; then
+  my_no=$(jq -r --arg sid "$session_id" \
+    '.sessions[] | select(.session_id == $sid) | .reviewer_no // empty' "$LOBBY_FILE" 2>/dev/null)
+  reason="You are reviewer R${my_no:-?}: reviewers are read-only and may not edit files. Discuss in the review room ($LOBBY_BIN/room.sh say --session $session_id --text \"...\") or record a verdict ($LOBBY_BIN/review.sh verdict --session $session_id ...). You may edit only after promotion to main."
+  jq -nc --arg reason "$reason" '{
+    hookSpecificOutput: {
+      hookEventName: "PreToolUse",
+      permissionDecision: "deny",
+      permissionDecisionReason: $reason
+    }
+  }'
+  exit 0
+fi
+
 # If the target file lives in a git repo different from our cwd anchor,
 # point this claim at the file's repo. That way two sessions launched from
 # different dirs (e.g. one in the repo, one in a parent) still coordinate
@@ -97,6 +117,10 @@ other_claim=$(
                       | .state = "active"
                       | .last_seen = $now_iso
                       | .last_seen_epoch = ($now | tonumber)
+                      # A successful claim is real progress: a main fixing
+                      # findings across many turns must not trip the
+                      # same-reason Stop-block cap.
+                      | .stop_blocks = 0
                  else . end
                )
           else .sessions += [{

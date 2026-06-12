@@ -2,11 +2,12 @@
 # Idempotent installer for the Claude Code lobby hooks.
 #
 # - Verifies dependencies (jq, flock, git).
-# - Registers the six lobby hooks in ~/.claude/settings.json, replacing any
+# - Registers the seven lobby hooks in ~/.claude/settings.json, replacing any
 #   previous lobby entries and preserving all other settings/hooks. A
 #   timestamped backup of settings.json is written first.
-# - Installs the /btw and /room slash commands into ~/.claude/commands/,
-#   rewritten to point at this clone of the repo.
+# - Installs the /btw, /room, /mission, /review-request, /review-status and
+#   /handoff slash commands into ~/.claude/commands/, rewritten to point at
+#   this clone of the repo.
 #
 # Safe to re-run after moving the repo or pulling updates.
 # Override the config dir with CLAUDE_CONFIG_DIR (default: ~/.claude).
@@ -54,19 +55,19 @@ jq --arg lobby "$LOBBY" '
   | .hooks.UserPromptSubmit = ((.hooks.UserPromptSubmit | drop_lobby) + [entry("inject.sh")])
   | .hooks.PreToolUse       = ((.hooks.PreToolUse       | drop_lobby) + [entry("claim.sh"; "Edit|Write|MultiEdit|NotebookEdit")])
   | .hooks.PostToolUse      = ((.hooks.PostToolUse      | drop_lobby) + [entry("post-edit-inbox.sh")])
-  | .hooks.Stop             = ((.hooks.Stop             | drop_lobby) + [entry("release.sh")])
+  | .hooks.Stop             = ((.hooks.Stop             | drop_lobby) + [entry("stop-gate.sh")])
   | .hooks.SessionEnd       = ((.hooks.SessionEnd       | drop_lobby) + [entry("cleanup.sh")])
 ' "$SETTINGS" > "$tmp"
 mv "$tmp" "$SETTINGS"
 
 # --- slash commands -----------------------------------------------------------
-for cmd in btw room; do
+for cmd in btw room mission review-request review-status handoff; do
   sed "s|~/.claude/hooks/lobby|$LOBBY|g" "$REPO_DIR/commands/$cmd.md" > "$COMMANDS_DIR/$cmd.md"
 done
 
 echo "Installed:"
 echo "  hooks    -> $SETTINGS (backup: $backup)"
-echo "  commands -> $COMMANDS_DIR/btw.md, $COMMANDS_DIR/room.md"
+echo "  commands -> $COMMANDS_DIR/{btw,room,mission,review-request,review-status,handoff}.md"
 echo
 echo "Last step (manual): copy the 'Multi-session coordination' block from the"
 echo "README into $CLAUDE_DIR/CLAUDE.md so agents know the protocol, then"
