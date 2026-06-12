@@ -35,7 +35,6 @@ while [[ $# -gt 0 ]]; do
 done
 
 lobby_init
-HOOKS_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 case "$cmd" in
   request)
@@ -63,10 +62,10 @@ case "$cmd" in
       status=$(session_field "$sid_full" '.review.status')
       case "$status" in
         in_review)
-          echo "review.sh request: a round is already in progress (waiting on R$(session_field "$sid_full" '.review.turn')). Run $HOOKS_DIR/review-wait.sh --session $sid_full instead." >&2
+          echo "review.sh request: a round is already in progress (waiting on R$(session_field "$sid_full" '.review.turn')). Run $LOBBY_BIN/review-wait.sh --session $sid_full instead." >&2
           exit 3 ;;
         escalated)
-          echo "review.sh request: review is escalated to the human after hitting the round cap. A human must run: $HOOKS_DIR/review.sh reset --session ${sid_full:0:8}" >&2
+          echo "review.sh request: review is escalated to the human after hitting the round cap. A human must run: $LOBBY_BIN/review.sh reset --session ${sid_full:0:8}" >&2
           exit 3 ;;
       esac
 
@@ -134,7 +133,7 @@ case "$cmd" in
         .sessions |= map(if .session_id == $main then .room_cursor = ($n | tonumber) else . end)
       ' --arg main "$sid_full" --argjson n "$total"
 
-      echo "review round $round open (turn: R$first_turn). Now run $HOOKS_DIR/review-wait.sh --session $sid_full repeatedly and obey its output until the round resolves. Do not start new work."
+      echo "review round $round open (turn: R$first_turn). Now run $LOBBY_BIN/review-wait.sh --session $sid_full repeatedly and obey its output until the round resolves. Do not start new work."
     ) 200>"$LOBBY_LOCK"
     exit $?
     ;;
@@ -166,7 +165,7 @@ case "$cmd" in
       status=$(session_field "$main_sid" '.review.status')
       turn=$(session_field "$main_sid" '.review.turn')
       if [[ "$status" != "in_review" || "$turn" != "$my_no" ]]; then
-        echo "review.sh verdict: not your turn (status: ${status:-none}, turn: R${turn:-?}, you: R$my_no). Run $HOOKS_DIR/review-wait.sh --session $sid_full and wait for your turn." >&2
+        echo "review.sh verdict: not your turn (status: ${status:-none}, turn: R${turn:-?}, you: R$my_no). Run $LOBBY_BIN/review-wait.sh --session $sid_full and wait for your turn." >&2
         exit 3
       fi
 
@@ -206,9 +205,9 @@ case "$cmd" in
 
       new_status=$(session_field "$main_sid" '.review.status')
       if [[ "$new_status" == "in_review" ]]; then
-        echo "verdict recorded; chain advanced to R$(session_field "$main_sid" '.review.turn'). Run $HOOKS_DIR/review-wait.sh --session $sid_full again."
+        echo "verdict recorded; chain advanced to R$(session_field "$main_sid" '.review.turn'). Run $LOBBY_BIN/review-wait.sh --session $sid_full again."
       else
-        echo "verdict recorded; round $round complete ($new_status). Run $HOOKS_DIR/review-wait.sh --session $sid_full again."
+        echo "verdict recorded; round $round complete ($new_status). Run $LOBBY_BIN/review-wait.sh --session $sid_full again."
       fi
     ) 200>"$LOBBY_LOCK"
     exit $?
@@ -218,8 +217,17 @@ case "$cmd" in
     (
       flock -w 10 200 || { echo "review.sh status: lobby lock busy, try again" >&2; exit 4; }
       lobby_prune
-      jq -r '
-        [.sessions[] | select(.role == "main")] as $mains
+      # With --session, show only that main (resolve reviewer -> its main).
+      filter_sid=""
+      if [[ -n "$session_id" ]]; then
+        filter_sid=$(resolve_sid "$session_id")
+        [[ -n "$filter_sid" ]] && {
+          frole=$(session_field "$filter_sid" '.role')
+          [[ "$frole" == "reviewer" ]] && filter_sid=$(session_field "$filter_sid" '.main_sid')
+        }
+      fi
+      jq -r --arg only "${filter_sid:-}" '
+        [.sessions[] | select(.role == "main" and ($only == "" or .session_id == $only))] as $mains
         | if ($mains | length) == 0 then "(no main sessions)"
           else $mains | map(. as $m |
             "main " + (.session_id[0:8]) +

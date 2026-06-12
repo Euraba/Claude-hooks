@@ -12,9 +12,14 @@
 #                approved/escalated are terminal: no block, one-shot message.
 #
 # Loop safety: every block either moves state toward a terminal state or bumps
-# a same-reason counter (stop_blocks, reset by review-wait.sh / state changes);
-# past LOBBY_MAX_SAME_BLOCKS the gate stops blocking and escalates to the
-# human instead. Sessions without a role are untouched.
+# a same-reason counter (stop_blocks, reset by real progress: claims, review
+# requests, verdicts); past LOBBY_MAX_SAME_BLOCKS the gate stops blocking and
+# escalates to the human instead.
+#
+# This is the ONLY Stop hook: when it decides the session may actually stop
+# (including all role-less sessions), it performs the end-of-turn release
+# (claims, anchors, waiter notifications, idle state) itself. When it blocks,
+# the release is skipped — a blocked main keeps its claims and stays active.
 . "$(dirname "$0")/lib.sh"
 
 [[ -z "${CLAUDE_PROJECT_DIR:-}" ]] && exit 0
@@ -24,10 +29,13 @@ session_id=$(jq -r '.session_id // empty' <<<"$input")
 transcript_path=$(jq -r '.transcript_path // empty' <<<"$input")
 [[ -z "$session_id" ]] && exit 0
 
-HOOKS_DIR="$(cd "$(dirname "$0")" && pwd)"
 HANDOFF_PCT="${LOBBY_HANDOFF_PCT:-50}"
 MAX_SAME_BLOCKS="${LOBBY_MAX_SAME_BLOCKS:-3}"
 MAX_IDLE_CYCLES="${LOBBY_REVIEWER_MAX_IDLE_CYCLES:-240}"
+
+# Estimated before taking the lobby lock: the transcript scan can be slow on
+# huge transcripts and must not stall other sessions' hooks.
+pct=$(estimate_ctx_pct "$transcript_path")
 
 # The locked gate communicates the decision by printing marker lines
 # (newlines in payloads encoded as \036):  BLOCK <reason> / SYS <message>
@@ -88,7 +96,7 @@ gate_decide() {
       printf 'SYS %s\n' "$(enc "lobby: reviewer $short idle cap reached ($idle wait cycles with no work) — released. Relaunch or prompt it to resume reviewing.")"
       exit 0
     fi
-    reason="You are reviewer R$(session_field "$session_id" '.reviewer_no') for ${main_sid:0:8}. Do not stop. Run $HOOKS_DIR/review-wait.sh --session $session_id via Bash and obey its output; when it prints NO_WORK, run it again."
+    reason="You are reviewer R$(session_field "$session_id" '.reviewer_no') for ${main_sid:0:8}. Do not stop. Run $LOBBY_BIN/review-wait.sh --session $session_id via Bash and obey its output; when it prints NO_WORK, run it again."
     n=$(bump_block_counter "$reason")
     if [[ "$n" -gt "$MAX_SAME_BLOCKS" ]]; then
       printf 'SYS %s\n' "$(enc "lobby: reviewer $short kept trying to stop without running review-wait ($n times) — released. It may need a manual prompt.")"
@@ -108,7 +116,6 @@ gate_decide() {
   handoff_status=$(session_field "$session_id" '.handoff.status')
   if [[ "$handoff_status" != "done" ]]; then
     has_reviewer=$(next_reviewer_no "$session_id" 0)
-    pct=$(estimate_ctx_pct "$transcript_path")
     if [[ "$handoff_status" == "pending" && -n "$pct" && "$pct" -lt "$HANDOFF_PCT" ]]; then
       lobby_write '
         .sessions |= map(if .session_id == $sid then del(.handoff) else . end)
@@ -131,7 +138,7 @@ gate_decide() {
           ' --arg sid "$session_id" --arg bp "$brief_path"
           printf 'SYS %s\n' "$(enc "lobby: main $short is at ${pct:-?}% context — handing off to reviewer R$has_reviewer.")"
         fi
-        reason="Your context window is at ${pct:-the configured} threshold (>=${HANDOFF_PCT}%). Before stopping you MUST hand off to your reviewer: (1) Write a handoff brief to $brief_path covering: current state of the work, in-flight/unfinished tasks, mission goal + spec/plan paths, key decisions made, exact next steps, and current review status. (2) Then run: $HOOKS_DIR/succession.sh handoff --session $session_id --brief $brief_path — your lowest-numbered reviewer will be promoted to main and continue from your brief."
+        reason="Your context window is at ${pct:-the configured} threshold (>=${HANDOFF_PCT}%). Before stopping you MUST hand off to your reviewer: (1) Write a handoff brief to $brief_path covering: current state of the work, in-flight/unfinished tasks, mission goal + spec/plan paths, key decisions made, exact next steps, and current review status. (2) Then run: $LOBBY_BIN/succession.sh handoff --session $session_id --brief $brief_path — your lowest-numbered reviewer will be promoted to main and continue from your brief."
         n=$(bump_block_counter "$reason")
         if [[ "$n" -gt "$MAX_SAME_BLOCKS" ]]; then
           printf 'SYS %s\n' "$(enc "lobby: main $short failed to complete its handoff after $n attempts — letting it stop. Run the handoff manually or start a fresh session from the review room history.")"
@@ -156,7 +163,7 @@ gate_decide() {
             else . end
           )
         ' --arg sid "$session_id"
-        printf 'SYS %s\n' "$(enc "lobby: main $short has unresolved review findings but all its reviewers are gone — escalating to you. Attach a new reviewer (LOBBY_ROLE=reviewer:1 LOBBY_MAIN=$short claude) and run $HOOKS_DIR/review.sh reset --session $short to resume, or take over manually.")"
+        printf 'SYS %s\n' "$(enc "lobby: main $short has unresolved review findings but all its reviewers are gone — escalating to you. Attach a new reviewer (LOBBY_ROLE=reviewer:1 LOBBY_MAIN=$short claude) and run $LOBBY_BIN/review.sh reset --session $short to resume, or take over manually.")"
         exit 0
       fi
       round=$(session_field "$session_id" '.review.round')
@@ -170,7 +177,7 @@ gate_decide() {
       ' "$LOBBY_FILE")
       reason="Reviewers requested changes in round $round — you may not stop until they approve. Unresolved findings:
 $findings
-Fix these, commit, then start round $((${round:-0}+1))/${maxr:-5} with: $HOOKS_DIR/review.sh request --session $session_id --summary \"<what you fixed>\""
+Fix these, commit, then start round $((${round:-0}+1))/${maxr:-5} with: $LOBBY_BIN/review.sh request --session $session_id --summary \"<what you fixed>\""
       n=$(bump_block_counter "$reason")
       if [[ "$n" -gt "$MAX_SAME_BLOCKS" ]]; then
         printf 'SYS %s\n' "$(enc "lobby: main $short stalled on round-$round findings ($n stop attempts without progress) — letting it stop. See review.sh status.")"
@@ -179,7 +186,7 @@ Fix these, commit, then start round $((${round:-0}+1))/${maxr:-5} with: $HOOKS_D
       printf 'BLOCK %s\n' "$(enc "$reason")"
       ;;
     in_review)
-      reason="A review round is in progress (waiting on R$(session_field "$session_id" '.review.turn')). Do not stop and do not start new work. Run $HOOKS_DIR/review-wait.sh --session $session_id and obey its output."
+      reason="A review round is in progress (waiting on R$(session_field "$session_id" '.review.turn')). Do not stop and do not start new work. Run $LOBBY_BIN/review-wait.sh --session $session_id and obey its output."
       n=$(bump_block_counter "$reason")
       if [[ "$n" -gt "$MAX_SAME_BLOCKS" ]]; then
         printf 'SYS %s\n' "$(enc "lobby: main $short kept stopping during an in-progress round ($n times) — letting it stop. The round will still resolve; prompt the session to run review-wait.")"
@@ -203,7 +210,7 @@ Fix these, commit, then start round $((${round:-0}+1))/${maxr:-5} with: $HOOKS_D
         lobby_write '
           .sessions |= map(if .session_id == $sid then .review.notified = true else . end)
         ' --arg sid "$session_id"
-        printf 'SYS %s\n' "$(enc "lobby: review DEADLOCKED after $(session_field "$session_id" '.review.round') rounds — human input needed. Inspect: $HOOKS_DIR/review.sh status; transcript: $HOOKS_DIR/room.sh show --room $(session_field "$session_id" '.review.room_id'); resume with: $HOOKS_DIR/review.sh reset --session $short")"
+        printf 'SYS %s\n' "$(enc "lobby: review DEADLOCKED after $(session_field "$session_id" '.review.round') rounds — human input needed. Inspect: $LOBBY_BIN/review.sh status; transcript: $LOBBY_BIN/room.sh show --room $(session_field "$session_id" '.review.room_id'); resume with: $LOBBY_BIN/review.sh reset --session $short")"
       fi
       ;;
   esac
@@ -229,6 +236,12 @@ while IFS= read -r line; do
 done <<EOF
 $out
 EOF
+
+# Actually stopping (no block) => perform the end-of-turn release. A blocked
+# session keeps its claims and active state while it continues working.
+if [[ -z "$block" ]]; then
+  lobby_stop_release "$session_id"
+fi
 
 if [[ -n "$block" || -n "$sys" ]]; then
   jq -nc --arg reason "$block" --arg sys "$sys" '

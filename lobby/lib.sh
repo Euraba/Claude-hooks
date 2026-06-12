@@ -228,11 +228,15 @@ append_room_line() {
   ) 201>"$f.lock"
 }
 
-# Generic field getter: session_field <sid> <jq-expr-relative-to-session>
-# e.g. session_field "$sid" '.role'. Prints empty if absent/null.
+# Generic field getter: session_field <sid> <dotted-path>, e.g. '.review.turn'.
+# Prints empty for missing/null. Booleans/numbers print as literals ("false"
+# stays distinguishable from absent — deliberately NOT `// empty`, which would
+# swallow boolean false).
 session_field() {
   jq -r --arg sid "$1" --arg path "$2" \
-    '.sessions[] | select(.session_id == $sid) | getpath($path | ltrimstr(".") | split(".")) // empty' \
+    '.sessions[] | select(.session_id == $sid)
+     | getpath($path | ltrimstr(".") | split(".")) as $v
+     | if $v == null then empty else ($v | tostring) end' \
     "$LOBBY_FILE"
 }
 
@@ -374,6 +378,42 @@ review_self_heal() {
   ' "$LOBBY_FILE")
   [[ "$alive" -gt 0 ]] && return 0
   review_advance "$main_sid" "$turn"
+}
+
+# End-of-turn release for session $1: clear claims and foreign anchors, notify
+# queued waiters, mark the session idle. Called by stop-gate.sh only when it
+# actually lets the session stop — a blocked session keeps its claims. Takes
+# the lobby lock itself; must NOT be called while holding it.
+lobby_stop_release() {
+  local sid="$1" now now_iso anchors
+  now=$(date +%s)
+  now_iso=$(date -Iseconds)
+  anchors=$(
+    (
+      flock -w 5 200 || exit 0
+      jq -r --arg sid "$sid" '
+        (.sessions[]? | select(.session_id == $sid) | .anchors // []) | .[]
+      ' "$LOBBY_FILE"
+      lobby_write "$LOBBY_JQ_DEFS"'
+        ((.sessions[] | select(.session_id == $sid) | .claims) // []) as $freed
+        | .sessions |= map(
+          if .session_id == $sid
+          then .claims = []
+               | .anchors = []
+               | .state = "idle"
+               | .last_seen = $now_iso
+               | .last_seen_epoch = ($now | tonumber)
+          else . end
+        )
+        | notify_waiters($freed; $reason; $now_iso)
+      ' --arg sid "$sid" --argjson now "$now" --arg now_iso "$now_iso" \
+        --arg reason "(released by ${sid:0:8})"
+    ) 200>"$LOBBY_LOCK"
+  )
+  while IFS= read -r anchor; do
+    [[ -n "$anchor" ]] && lobby_release_anchor "$sid" "$anchor" clear
+  done <<<"$anchors"
+  return 0
 }
 
 # Print any new room messages for $1 (session_id) and advance their room_cursor.

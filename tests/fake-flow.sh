@@ -281,6 +281,17 @@ out=$("$HOOKS/review-wait.sh" --session "$R3" --timeout 30 --interval 1)
 assert_contains "inbox surfaced" "heads up about widget" "$out"
 assert_contains "returns with MESSAGES instruction" "MESSAGES" "$out"
 
+echo "== 20. single Stop hook: blocked keeps claims, allowed stop releases =="
+# R1 (main, changes_requested, R3 attached) holds app.txt from test 11.
+assert_eq "precondition: R1 holds a claim" "1" "$(field '.sessions[] | select(.session_id == "'$R1'") | .claims | length')"
+out=$(hook "$R1" "{transcript_path: \"$TMP/transcript.jsonl\"}" | "$HOOKS/stop-gate.sh")
+assert_contains "R1 blocked on findings" '"decision":"block"' "$out"
+assert_eq "blocked main keeps its claim" "1" "$(field '.sessions[] | select(.session_id == "'$R1'") | .claims | length')"
+# M2 (escalated + already notified) may stop: the gate performs the release.
+hook "$M2" "{transcript_path: \"$TMP/transcript.jsonl\"}" | "$HOOKS/stop-gate.sh" >/dev/null
+assert_eq "allowed stop releases claims" "0" "$(field '.sessions[] | select(.session_id == "'$M2'") | .claims | length')"
+assert_eq "allowed stop marks idle" "idle" "$(field '.sessions[] | select(.session_id == "'$M2'") | .state')"
+
 echo
 echo "$PASS passed, $FAIL failed"
 [[ "$FAIL" -eq 0 ]]

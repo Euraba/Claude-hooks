@@ -49,7 +49,7 @@ git clone <repo-url> ~/.claude/hooks   # or anywhere you like
 `install.sh` is idempotent (safe to re-run after pulling updates or moving the repo). It:
 
 1. Checks dependencies (`jq`, `flock`, `git`).
-2. Registers the seven hooks in `~/.claude/settings.json` — previous lobby entries are
+2. Registers the six hooks in `~/.claude/settings.json` — previous lobby entries are
    replaced, everything else is preserved, and a timestamped backup is written first.
 3. Installs the `/btw`, `/room`, `/mission`, `/review-request`, `/review-status` and
    `/handoff` slash commands into `~/.claude/commands/`, rewritten to point at wherever
@@ -68,8 +68,7 @@ Then copy the [agent protocol block](#teach-your-agents-the-protocol) into your
 | `UserPromptSubmit`| —                                  | `lobby/inject.sh`     | Heartbeat, clear per-turn claims, inject inbox + other sessions' notes/claims + new room messages. |
 | `PreToolUse`      | `Edit\|Write\|MultiEdit\|NotebookEdit` | `lobby/claim.sh`  | Deny edits from reviewers; claim the target file or deny if another session holds it. |
 | `PostToolUse`     | — (all tools)                      | `lobby/post-edit-inbox.sh` | Heartbeat; deliver newly-arrived inbox / room messages mid-execution; warn a main nearing the handoff threshold. |
-| `Stop`            | —                                  | `lobby/release.sh`    | End of turn: release this session's file claims, notify queued waiters, mark session idle. |
-| `Stop`            | —                                  | `lobby/stop-gate.sh`  | Role gate: keep reviewers in their wait loop, keep a main working while findings are unresolved, trigger context-overflow succession. |
+| `Stop`            | —                                  | `lobby/stop-gate.sh`  | Role gate: keep reviewers in their wait loop, keep a main working while findings are unresolved, trigger context-overflow succession. When it lets the session stop, it performs the end-of-turn release (claims, waiter notifications, idle state) — a blocked session keeps its claims. |
 | `SessionEnd`      | —                                  | `lobby/cleanup.sh`    | Remove the session; delete rooms with no members left; notify the review room when a main ends. |
 
 Supporting pieces:
@@ -86,6 +85,8 @@ Supporting pieces:
 - `lobby/review-wait.sh` — the polling wait loop that keeps reviewers (and a main waiting
   on a round) awake and returns work packets.
 - `lobby/succession.sh` — promotes a reviewer to main on context-overflow handoff.
+- `lobby/release.sh` — back-compat wrapper around the end-of-turn release for
+  older hand-wired settings; `stop-gate.sh` is the Stop hook of record.
 
 - `install.sh` — idempotent installer (hooks + slash commands).
 - `commands/*.md` — the `/btw`, `/room`, `/mission`, `/review-request`, `/review-status`

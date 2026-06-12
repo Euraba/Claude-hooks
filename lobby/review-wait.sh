@@ -32,9 +32,12 @@ lobby_init
 sid_full=$(resolve_sid "$session_id")
 [[ -z "$sid_full" ]] && { echo "review-wait.sh: --session '$session_id' did not match any live session" >&2; exit 2; }
 short="${sid_full:0:8}"
-HOOKS_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-# ---- packet builders (read-only; caller holds the lock) ---------------------
+# ---- packet builders ---------------------------------------------------------
+# Read-only, run WITHOUT the lobby lock: lobby.json is rename-replaced so reads
+# are atomic, and the git log/diff here can be slow on big repos — holding the
+# lock would stall every other session's hooks. Worst case a packet renders
+# from a state that just changed; the verdict's locked turn check catches it.
 
 render_findings() { # main_sid round [request_changes_only]
   jq -r --arg sid "$1" --argjson r "$2" --arg only "${3:-}" '
@@ -90,9 +93,9 @@ build_review_packet() { # I am a reviewer and it is my turn
   render_findings "$main_sid" "$round" ""
   echo
   echo "When done, record exactly one verdict:"
-  echo "  $HOOKS_DIR/review.sh verdict --session $sid_full --verdict approve|request_changes --text \"<your findings>\""
-  echo "You may also discuss first via: $HOOKS_DIR/room.sh say --session $sid_full --text \"...\""
-  echo "Then run $HOOKS_DIR/review-wait.sh --session $sid_full again."
+  echo "  $LOBBY_BIN/review.sh verdict --session $sid_full --verdict approve|request_changes --text \"<your findings>\""
+  echo "You may also discuss first via: $LOBBY_BIN/room.sh say --session $sid_full --text \"...\""
+  echo "Then run $LOBBY_BIN/review-wait.sh --session $sid_full again."
 }
 
 build_main_result() { # my round resolved
@@ -101,13 +104,13 @@ build_main_result() { # my round resolved
     changes_requested)
       echo "CHANGES_REQUESTED — round $round findings:"
       render_findings "$sid_full" "$round" "request_changes"
-      echo "Fix these, commit, then re-request: $HOOKS_DIR/review.sh request --session $sid_full --summary \"<what you fixed>\""
+      echo "Fix these, commit, then re-request: $LOBBY_BIN/review.sh request --session $sid_full --summary \"<what you fixed>\""
       ;;
     approved)
       echo "APPROVED — all reviewers approved round $round. Summarize the milestone for the user, then you may stop (the user will be notified)."
       ;;
     escalated)
-      echo "ESCALATED — round cap reached without approval. Stop and tell the user the review is deadlocked; a human can resume it with: $HOOKS_DIR/review.sh reset --session $short"
+      echo "ESCALATED — round cap reached without approval. Stop and tell the user the review is deadlocked; a human can resume it with: $LOBBY_BIN/review.sh reset --session $short"
       ;;
     *)
       echo "NO_REVIEW — no review round is in progress (status: ${status:-idle})."
@@ -241,18 +244,18 @@ EOF
         else
           echo "(handoff brief missing — check $HANDOFFS_DIR and the review room transcript)"
         fi
-        echo "Continue the work from the brief. Re-read the spec/plan if referenced. Declare your next milestone with: $HOOKS_DIR/review.sh request --session $sid_full --summary \"...\""
+        echo "Continue the work from the brief. Re-read the spec/plan if referenced. Declare your next milestone with: $LOBBY_BIN/review.sh request --session $sid_full --summary \"...\""
         ;;
       REVIEW)
         set -- $wake   # REVIEW <main_sid> <my_no> — no spaces in either
-        ( flock -w 10 200 || exit 0; build_review_packet "$2" "$3" ) 200>"$LOBBY_LOCK"
+        build_review_packet "$2" "$3"
         ;;
       MAIN_GONE)
         echo "MAIN_GONE — your main session ended without promoting you. Your review duties are over; you may stop now and tell the user."
         ;;
       MAIN_RESULT)
         set -- $wake   # MAIN_RESULT <status> <round>
-        ( flock -w 10 200 || exit 0; build_main_result "$2" "$3" ) 200>"$LOBBY_LOCK"
+        build_main_result "$2" "$3"
         ;;
       RETIRED)
         echo "RETIRED — you already handed off to your heir; your duties here are done. Tell the user what happened and stop (your Stop hook shows the handoff details)."
@@ -280,7 +283,7 @@ EOF
       ' --arg sid "$sid_full"
     ) 200>"$LOBBY_LOCK"
     printf '%s\n' "$chatter"
-    echo "MESSAGES — handle the above (reply via $HOOKS_DIR/room.sh say or $HOOKS_DIR/btw.sh send as appropriate), then run $HOOKS_DIR/review-wait.sh --session $sid_full again now."
+    echo "MESSAGES — handle the above (reply via $LOBBY_BIN/room.sh say or $LOBBY_BIN/btw.sh send as appropriate), then run $LOBBY_BIN/review-wait.sh --session $sid_full again now."
     exit 0
   fi
 
@@ -306,10 +309,10 @@ EOF
       msid=$(session_field "$sid_full" '.main_sid')
       st=$(session_field "$msid" '.review.status')
       tn=$(session_field "$msid" '.review.turn')
-      echo "NO_WORK (review status: ${st:-idle}, turn: R${tn:-—}). Run $HOOKS_DIR/review-wait.sh --session $sid_full again now."
+      echo "NO_WORK (review status: ${st:-idle}, turn: R${tn:-—}). Run $LOBBY_BIN/review-wait.sh --session $sid_full again now."
     else
       st=$(session_field "$sid_full" '.review.status')
-      echo "NO_WORK (your review status: ${st:-idle}). Run $HOOKS_DIR/review-wait.sh --session $sid_full again now."
+      echo "NO_WORK (your review status: ${st:-idle}). Run $LOBBY_BIN/review-wait.sh --session $sid_full again now."
     fi
     exit 0
   fi
