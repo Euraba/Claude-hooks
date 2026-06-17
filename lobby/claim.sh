@@ -4,6 +4,9 @@
 #   - Otherwise, record the claim under this session and allow.
 . "$(dirname "$0")/lib.sh"
 
+# Fall back to the git-root anchor when launched without CLAUDE_PROJECT_DIR set.
+[[ -z "${CLAUDE_PROJECT_DIR:-}" ]] && CLAUDE_PROJECT_DIR="${LOBBY_ANCHOR:-}"
+export CLAUDE_PROJECT_DIR
 [[ -z "${CLAUDE_PROJECT_DIR:-}" ]] && exit 0
 input=$(cat)
 session_id=$(jq -r '.session_id // empty' <<<"$input")

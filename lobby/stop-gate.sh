@@ -22,6 +22,9 @@
 # the release is skipped — a blocked main keeps its claims and stays active.
 . "$(dirname "$0")/lib.sh"
 
+# Fall back to the git-root anchor when launched without CLAUDE_PROJECT_DIR set.
+[[ -z "${CLAUDE_PROJECT_DIR:-}" ]] && CLAUDE_PROJECT_DIR="${LOBBY_ANCHOR:-}"
+export CLAUDE_PROJECT_DIR
 [[ -z "${CLAUDE_PROJECT_DIR:-}" ]] && exit 0
 [[ -f "$LOBBY_FILE" ]] || exit 0
 input=$(cat)
