@@ -9,6 +9,9 @@
 # serves as a turn-boundary reminder).
 . "$(dirname "$0")/lib.sh"
 
+# Fall back to the git-root anchor when launched without CLAUDE_PROJECT_DIR set.
+[[ -z "${CLAUDE_PROJECT_DIR:-}" ]] && CLAUDE_PROJECT_DIR="${LOBBY_ANCHOR:-}"
+export CLAUDE_PROJECT_DIR
 if [[ -z "${CLAUDE_PROJECT_DIR:-}" ]]; then
   echo '{}'
   exit 0
